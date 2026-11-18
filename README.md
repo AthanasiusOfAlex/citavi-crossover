@@ -9,11 +9,12 @@ Wine, and re-applies them after every Citavi update. One more command,
 Tested with Citavi 7.4.1.3, CrossOver 26.3 and Wine Stable 11.0, macOS 27.2 on Apple Silicon.
 
 **In this file:** [What to expect](#what-to-expect) ·
-[CrossOver or Wine](#crossover-or-wine) · [Quick start](#quick-start) ·
-[With Wine](#with-wine-instead-of-crossover) ·
+[CrossOver or Wine](#crossover-or-wine) ·
+[Quick start with CrossOver](#quick-start-with-crossover) ·
+[Quick start with Wine](#quick-start-with-wine) ·
 [If something goes differently](#if-something-goes-differently) ·
 [Everyday commands](#everyday-commands) · [Updating](#when-a-new-citavi-version-comes-out) ·
-[Removing it](#removing-it) · [Known limits](#known-limits)
+[Removing it](#removing-it) · [Notes on Wine](#notes-on-wine) · [Known limits](#known-limits)
 
 ## What to expect
 
@@ -35,15 +36,16 @@ CrossOver is built on Wine. The tool works with either.
 | | CrossOver | Wine |
 |---|---|---|
 | Price | paid, with a free trial of 14 days | free |
-| To install it | download it and open it once | one Homebrew command, or a download; then one command so that macOS lets it start |
+| To install it | download it and open it once | two Homebrew commands, or a download; then one command so that macOS lets it start |
 | Setup takes | about 15 minutes | about 20 minutes |
 | Citavi is started from | CrossOver's window | the app *Citavi 7* in `~/Applications`, which setup makes |
 | Tested with | CrossOver 26.3 | Wine Stable 11.0 |
 
-The Quick start below is written for CrossOver.
-[With Wine instead of CrossOver](#with-wine-instead-of-crossover) lists what differs.
+There is a Quick start for each: [with CrossOver](#quick-start-with-crossover) and
+[with Wine](#quick-start-with-wine). Each is complete by itself, so follow one and skip the
+other.
 
-## Quick start
+## Quick start with CrossOver
 
 You need an Apple Silicon Mac, [CrossOver](https://www.codeweavers.com/crossover) (the free trial
 or a licence), 6 GB of free disk space, an internet connection, and a Citavi account to sign in
@@ -109,74 +111,119 @@ browser asks whether to open *Citavi Login Helper*: allow it, and Citavi continu
 
 If CrossOver was open during setup, it shows the new bottle only after you quit and reopen it.
 
-## With Wine instead of CrossOver
+That is all. The next section is the same route for Wine; go on at
+[If something goes differently](#if-something-goes-differently) or
+[Everyday commands](#everyday-commands).
 
-Everything in the Quick start applies, with these differences.
+## Quick start with Wine
 
-**1. Install Wine Stable** instead of CrossOver. With [Homebrew](https://brew.sh):
+You need an Apple Silicon Mac, 6 GB of free disk space, an internet connection, and a Citavi
+account to sign in with. Wine itself is free. [Homebrew](https://brew.sh) is the easiest way to
+install it, and step 1 also says how to do without. No developer tools are needed.
+
+**1. Install Wine Stable.** Open Terminal (it is in *Applications ▸ Utilities*). With Homebrew,
+paste these two lines one after the other, pressing Return after each. The first adds
+`gcenx/wine`, the Homebrew tap (a source of packages) that provides Wine Stable. Homebrew's own
+list stopped offering it in September 2026, so without the tap the second line fails.
+
+```bash
+brew tap gcenx/wine
+```
 
 ```bash
 brew install --cask wine-stable
 ```
 
-Without Homebrew, the macOS section of
+Without Homebrew: the macOS section of
 [Wine's download page](https://gitlab.winehq.org/wine/wine/-/wikis/Download) links to the same
-app; move it to Applications. Wine also needs Rosetta
-(`softwareupdate --install-rosetta`).
+app. Download it, unpack it and move *Wine Stable* to Applications.
 
-**2. Let macOS start it.** macOS marks every downloaded app and refuses to start one that no
+**2. Install Rosetta, if the Mac does not have it.** Wine needs Rosetta, Apple's translator for
+programs built for Intel processors. If you do not know whether it is there, go on to the next
+step: setup checks, and names this command if Rosetta is missing.
+
+```bash
+softwareupdate --install-rosetta
+```
+
+**3. Let macOS start Wine.** macOS marks every downloaded app and refuses to start one that no
 registered developer signed. Wine is not signed, so take the mark off:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Wine Stable.app"
 ```
 
-**3. Get the folder and run setup** as in the Quick start. If CrossOver is not on the Mac, the
-tool uses Wine by itself:
+**4. Get this folder.** Paste this line and press Return. It downloads the folder into your home
+folder as `citavi-crossover`:
+
+```bash
+cd ~ && mkdir citavi-crossover && curl -L https://github.com/AthanasiusOfAlex/citavi-crossover/archive/refs/heads/main.tar.gz | tar xz --strip-components 1 -C citavi-crossover
+```
+
+Other ways: on the project's GitHub page, *Code ▸ Download ZIP*, then unpack the ZIP and move the
+folder to where it can stay; or `git clone`. Keep the folder: you use it again for updates and
+for removing Citavi.
+
+**5. Go into the folder.**
+
+```bash
+cd ~/citavi-crossover
+```
+
+If the folder is somewhere else: type `cd ` with a space after it, drag the folder from Finder
+into the Terminal window, and press Return.
+
+**6. Run setup.**
 
 ```bash
 ./citavi-crossover setup
 ```
 
-If CrossOver is installed too, say which one you mean:
+If CrossOver is on this Mac too, the tool would use CrossOver. Say that you mean Wine:
 
 ```bash
 CITAVI_ENGINE=wine ./citavi-crossover setup
 ```
 
-The same goes for every later command (`run`, `doctor`, `update`, `uninstall`). To make Wine the
-standing choice, change the `ENGINE=` line in `config.sh` to `ENGINE="${CITAVI_ENGINE:-wine}"`.
+In that case put `CITAVI_ENGINE=wine` before every later command as well (`run`, `doctor`,
+`update`, `uninstall`). Or make Wine the standing choice: in `config.sh`, change the `ENGINE=`
+line to `ENGINE="${CITAVI_ENGINE:-wine}"`.
 
-**4. Start Citavi** with the app *Citavi 7*, which setup puts into `~/Applications`. Spotlight
-and Launchpad find it, and it can be kept in the Dock. `./citavi-crossover run` works too.
+Setup first checks the Mac and tells you exactly what to do if something is missing. Then it asks
+two yes-or-no questions, both because the installers run without showing their licence screens:
+whether you accept Microsoft's licence terms for the .NET Framework, and Citavi's. After that it
+needs nothing from you for about 20 minutes. Small Windows progress windows come and go. It:
 
-What is different with Wine:
+1. creates a Wine bottle named *Citavi 7* in
+   `~/Library/Application Support/citavi-crossover/Bottles`;
+2. downloads Microsoft .NET Framework 4.0 and 4.8 from Microsoft (120 MB) and installs them;
+3. applies the registry fixes and copies the fonts;
+4. downloads Citavi's installer from Citavi (160 MB) and installs it;
+5. patches seven of Citavi's program files, installs the login helper and makes the app
+   *Citavi 7*;
+6. checks everything and ends with **Citavi is ready.**
 
-- The bottle is a folder in `~/Library/Application Support/citavi-crossover/Bottles`. Wine calls
-  such a folder a *prefix*. A bottle belongs to the program that made it: the tool refuses to use
-  a CrossOver bottle with Wine, or a Wine bottle with CrossOver.
-- Wine 11.0 cannot run 32-bit .NET programs on a Mac: they hang when they start. Citavi is a
-  64-bit program and is not affected, but two installers use 32-bit .NET on the way. The tool
-  deals with both: it stops the 32-bit half of .NET's own setup, and it takes the 32-bit steps
-  out of its copy of Citavi's installer and does their work itself. One effect: Citavi's file
-  types, the Word add-in and the browser pickers are not registered in the bottle. None of them
-  has a use there.
-- Installing .NET takes a few minutes longer. `setup --guided` does not exist, because Wine has
-  no installer window of its own.
-- While Citavi runs, the Dock shows it under the name *wine* with a plain icon, not as Citavi.
-- Citavi's installer puts a Windows shortcut, `Citavi 7.lnk`, on the Mac's Desktop, because a
-  Wine bottle uses the Mac's Desktop folder as its own. Setup removes it again.
-- The icon of the app *Citavi 7* is Citavi's own, read from the installed program. It is a
-  small picture enlarged, so it looks soft.
+If it stops, run the same command again: it continues where it left off.
 
-Checked with Wine Stable 11.0 on macOS 27 (November 2026): setup from scratch, signing in,
-opening a cloud project, PDF preview, the word processor, text fields with Greek, Cyrillic and
-Hebrew, and copy and paste. Wine Devel and Wine Staging have not been tried.
+**7. Start Citavi and sign in.** Setup offers to start Citavi when it has finished. Later, start
+it with the app *Citavi 7*, which setup put into `~/Applications`. Spotlight and Launchpad find
+it, and it can be kept in the Dock. This works too:
 
-With both CrossOver and Wine on one Mac you can have a Citavi in each. They share
-`~/Documents/Citavi 7`, so do not open the same local project in both at once. Sign-in links go
-to one bottle at a time: `./citavi-crossover helper` points them at the bottle of the engine you
-run it with.
+```bash
+./citavi-crossover run
+```
+
+While Citavi runs, the Dock shows it under the name *wine* with a plain icon.
+
+The first time, Citavi shows a short welcome assistant: click **Let's go**, then **Close**. If
+you have Citavi 6 projects in `Documents/Citavi 6`, the assistant copies them to
+`Documents/Citavi 7`.
+
+Click **Log in** in Citavi. Your browser opens Citavi's sign-in page. After you sign in, the
+browser asks whether to open *Citavi Login Helper*: allow it, and Citavi continues on its
+"Remember me" page.
+
+[Notes on Wine](#notes-on-wine) has the details that differ from CrossOver.
 
 ## If something goes differently
 
@@ -185,12 +232,12 @@ run it with.
 | `permission denied: ./citavi-crossover` | Run `zsh citavi-crossover setup` instead. |
 | Terminal asks for access to your Downloads, Documents or Desktop folder, or to a removable volume | Allow it. The tool reads its own folder, and the bottle if the bottles are kept on an external disk. |
 | *Citavi Login Helper* or *Citavi 7* asks for access to files on a removable volume | Allow it. This happens once when the bottle is on an external disk; the app starts Citavi from there. |
-| *CrossOver is not installed*, *has never been opened*, or *Rosetta is not installed* | Do what the message says, then run setup again. |
+| *CrossOver is not installed* or *has never been opened*, *Wine is not installed* or *macOS does not let it start*, or *Rosetta is not installed* | Do what the message says, then run setup again. |
 | A download fails | Check the internet connection and run setup again; it continues the download. |
 | *the unattended .NET install did not work* | Answer `y` to the question that follows, or run `./citavi-crossover setup --guided` later. See below. |
 | Citavi shows *A program error has occurred* | Click **Cancel** in the dialog. Then run `./citavi-crossover diagnose` and follow [docs/ADAPTING.md](docs/ADAPTING.md). |
 | *the fixes were last checked with Citavi …, and this is another version* | Citavi's download link offers a newer Citavi than the one the fixes were written for. Often everything still works. If Citavi misbehaves, run `./citavi-crossover diagnose`. |
-| CrossOver's trial has ended | Buy a CrossOver licence, or change to Wine: install it as described above and run `CITAVI_ENGINE=wine ./citavi-crossover setup`. Your projects in `Documents/Citavi 7` are used by both, and cloud projects come back when you sign in. |
+| CrossOver's trial has ended | Buy a CrossOver licence, or change to Wine: follow [Quick start with Wine](#quick-start-with-wine), using `CITAVI_ENGINE=wine ./citavi-crossover setup` in its step 6. Your projects in `Documents/Citavi 7` are used by both, and cloud projects come back when you sign in. |
 | Anything else | `./citavi-crossover doctor` lists what is in place and names the command that repairs the rest. |
 
 ### Installing .NET through CrossOver's own window
@@ -314,6 +361,36 @@ bottle until `./citavi-crossover patch` is run again.
 *Citavi 7*, then *Bottle ▸ Delete Bottle…*; for Wine: the folder
 `~/Library/Application Support/citavi-crossover`), then `Citavi Login Helper.app` and
 `Citavi 7.app` in `~/Applications`, and `CitaviLoginHelper.log` in `~/Library/Logs`.
+
+## Notes on Wine
+
+What is different when the tool runs with Wine and not with CrossOver:
+
+- The bottle is a folder in `~/Library/Application Support/citavi-crossover/Bottles`. Wine calls
+  such a folder a *prefix*. A bottle belongs to the program that made it: the tool refuses to use
+  a CrossOver bottle with Wine, or a Wine bottle with CrossOver.
+- Wine 11.0 cannot run 32-bit .NET programs on a Mac: they hang when they start. Citavi is a
+  64-bit program and is not affected, but two installers use 32-bit .NET on the way. The tool
+  deals with both: it stops the 32-bit half of .NET's own setup, and it takes the 32-bit steps
+  out of its copy of Citavi's installer and does their work itself. One effect: Citavi's file
+  types, the Word add-in and the browser pickers are not registered in the bottle. None of them
+  has a use there.
+- Installing .NET takes a few minutes longer. `setup --guided` does not exist, because Wine has
+  no installer window of its own.
+- While Citavi runs, the Dock shows it under the name *wine* with a plain icon, not as Citavi.
+- Citavi's installer puts a Windows shortcut, `Citavi 7.lnk`, on the Mac's Desktop, because a
+  Wine bottle uses the Mac's Desktop folder as its own. Setup removes it again.
+- The icon of the app *Citavi 7* is Citavi's own, read from the installed program. It is a
+  small picture enlarged, so it looks soft.
+
+Checked with Wine Stable 11.0 on macOS 27 (November 2026): setup from scratch, signing in,
+opening a cloud project, PDF preview, the word processor, text fields with Greek, Cyrillic and
+Hebrew, and copy and paste. Wine Devel and Wine Staging have not been tried.
+
+With both CrossOver and Wine on one Mac you can have a Citavi in each. They share
+`~/Documents/Citavi 7`, so do not open the same local project in both at once. Sign-in links go
+to one bottle at a time: `./citavi-crossover helper` points them at the bottle of the engine you
+run it with.
 
 ## Display and fonts
 
