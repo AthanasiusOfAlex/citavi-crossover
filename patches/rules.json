@@ -1,0 +1,132 @@
+{
+  // IL patch rules for running Citavi under Wine/CrossOver.
+  // kind "redirect-call":   every call to `from` in every assembly in Citavi's bin folder becomes a call to `to`.
+  // kind "return-constant": the body of assembly!type::method is replaced by `return value`. For a method
+  //                         returning an enum, `value` is the number behind the enum member.
+  // kind "set-field-constant": where a method of assembly!type stores the integer `was` into `field`, it stores `value`.
+  //                            Optional "method" limits it to methods of that name.
+  // kind "fill-region-as-rectangles": in assembly!type::method, Graphics.FillRegion(brush, region) is replaced by
+  //                         Graphics.FillRectangles(brush, the rectangles the region consists of).
+  // kind "set-field-to-window-width": assembly!type::method (a method of a control) begins by storing the control's
+  //                         real width, asked from Windows, into the integer `field`.
+  // kind "complete-character-placement": assembly!type::method is the program's own declaration of the Windows
+  //                         function GetCharacterPlacement. Every call of it goes through an added method that
+  //                         fills in the two results Wine leaves out: caret positions and character classes.
+  // kind "draw-trackbar-thumb": assembly!type is a control with a slider (TrackBar) in its field `field`. The control
+  //                         gets a WndProc that draws the slider's thumb itself: a filled pointer, blue, or grey
+  //                         while the slider is disabled or being dragged.
+  // kind "wide-character-call": assembly!type::method is the program's own declaration of a Windows function that has
+  //                         a single-byte-text form (…A) and a 16-bit-text form (…W). The declaration is changed to
+  //                         ask for the 16-bit form.
+  // kind "return-constant-for-argument": assembly!type::method takes a string first and returns a string. It begins
+  //                         with a new statement: if the first argument equals `when`, return `value`.
+  // In "assembly", * stands for any text (for libraries with their version in the file name).
+  // Set "enabled": false to switch a rule off without deleting it.
+  "rules": [
+    {
+      "id": "default-input-language",
+      "kind": "redirect-call",
+      "from": "System.Windows.Forms.InputLanguage::get_DefaultInputLanguage",
+      "to": "System.Windows.Forms.InputLanguage::get_CurrentInputLanguage",
+      "why": "Wine's SystemParametersInfo(SPI_GETDEFAULTINPUTLANG) returns success without filling in the layout handle, so InputLanguage.DefaultInputLanguage has handle 0 and .Culture throws CultureNotFoundException (seen at startup in ProofingToolsSettings.DefaultSpellCheckCulture). CurrentInputLanguage goes through GetKeyboardLayout, which Wine implements."
+    },
+    {
+      "id": "managed-websocket-transport",
+      "kind": "return-constant",
+      "assembly": "SwissAcademic.Citavi.dll",
+      "type": "SwissAcademic.Citavi.AblyClient",
+      "method": "UseWebsocket4Net",
+      "value": true,
+      "why": "Cloud projects refuse to open ('A connection to the Citavi Cloud could not be established') unless Citavi's realtime channel (Ably) is connected, and that channel is a WebSocket. .NET's ClientWebSocket needs Windows' websocket.dll, which Wine only stubs: WebSocketProtocolComponent throws 'Not implemented' every 10 seconds. Citavi ships a fully managed transport (WebSocket4Net) that it normally uses only on Windows older than 8; this makes it use that one always."
+    },
+    {
+      "id": "managed-websocket-tls12",
+      "kind": "set-field-constant",
+      "assembly": "WebSocket4Net.dll",
+      "type": "WebSocket4Net.WebSocket",
+      "field": "m_SecureProtocols",
+      "was": 240,
+      "value": 3072,
+      "why": "Needed by managed-websocket-transport. WebSocket4Net defaults to SslProtocols.Default (240 = SSL 3 + TLS 1.0) and Citavi does not override it; Ably's servers refuse that, so the handshake ends in AuthenticationException 'A call to SSPI failed'. 3072 = SslProtocols.Tls12."
+    },
+    {
+      "id": "text-editor-full-text",
+      "kind": "set-field-constant",
+      "assembly": "SwissAcademic.Controls.dll",
+      "type": "SwissAcademic.Controls.TextEditor",
+      "method": "get_Text",
+      "field": "flags",
+      "was": 4,
+      "value": 16,
+      "why": "Text typed into many of Citavi's fields is read back cut to half its length: a new project named 'CrossOver sync test' is created as 'CrossOver'. TextEditor.Text asks the rich-edit control for the text length with EM_GETTEXTLENGTHEX flag GTL_CLOSE (4) and uses the answer plus 2 as a buffer size in bytes. Wine answers GTL_CLOSE in characters, half of what is needed (measured with a probe in the bottle); Windows evidently answers with at least the byte count, since Citavi works there. GTL_NUMBYTES (16) asks for bytes explicitly, which Wine answers correctly."
+    },
+    {
+      "id": "infragistics-dpi-awareness",
+      "kind": "return-constant",
+      "assembly": "Infragistics4.Win.v*.dll",
+      "type": "Infragistics.Win.NativeWindowMethods",
+      "method": "GetProcessDpiAwarenessApi",
+      "value": 1,
+      "why": "In Retina mode the scrollbars of Citavi's lists (and everything else its Infragistics controls size by themselves) are drawn at half size: 17 pixels wide instead of 34. Infragistics asks GetProcessDpiAwareness(Process.GetCurrentProcess().Handle) whether the program is DPI-aware and, if the answer is 'unaware', does all its own sizing for 96 dpi. Wine answers that question correctly only for the pseudo handle of the current process; for a real handle to the same process, which is what .NET passes, it answers 'unaware' (measured with a probe in the bottle: real handle 0, pseudo handle 1; win32u logs 'not supported on other process'). 1 = PROCESS_SYSTEM_DPI_AWARE, which is what Citavi.exe's manifest declares (dpiAware True) and so what Windows answers. With Retina mode off the answer is still right: the system dpi is then 96."
+    },
+    {
+      "id": "text-field-border-fill",
+      "kind": "fill-region-as-rectangles",
+      "assembly": "SwissAcademic.Controls.dll",
+      "type": "SwissAcademic.Controls.TextEditor",
+      "method": "DrawNonClientBackground",
+      "why": "After switching tabs in the Reference Editor, thin strips of the previous tab stay visible along the bottom and right edge of every text field. Each field (TextEditor) has a border area of 3 pixels around its text, which it clears itself: it takes a drawing surface for the whole window (GetWindowDC) and calls Graphics.FillRegion with the frame-shaped region. Wine's GDI+ clips FillRegion on a window's surface to the size of the window's inner (client) area, measured from the surface's corner, so the last rows and columns of the frame are never painted; a forced repaint does not help. Measured with a probe in the bottle on a 300x80 window with a 291x74 client area: FillRegion reaches columns 0-289 and rows 0-72, FillRectangle and FillRectangles reach everything. The region is a frame of four rectangles, so filling its rectangles paints the same pixels. Each call creates one small Matrix object that .NET's garbage collector frees."
+    },
+    {
+      "id": "text-field-auto-height-width",
+      "kind": "set-field-to-window-width",
+      "assembly": "SwissAcademic.Controls.dll",
+      "type": "SwissAcademic.Controls.TextEditor",
+      "method": "OnContentsResized",
+      "field": "_newWidth",
+      "why": "On the Overview tab the title and citation stay in a narrow column (416 pixels in a 2700-pixel row) and are cut off after two lines. The field is a TextEditor that fits its height to its text: when the rich edit control reports a new content height (EN_REQUESTRESIZE), OnContentsResized sets the field's bounds to that height and to the width in _newWidth, which TextEditor records in WM_SIZE. That relies on the report coming during WM_SIZE, as the code implies it does on Windows. Wine's rich edit control re-wraps the text one message earlier, in WM_WINDOWPOSCHANGED, so the report arrives while _newWidth (and Control.Width) still hold the old width, and the field sets itself back to it. It only happens when the new width changes the number of lines, which is why one-line fields are fine. Measured with a probe in the bottle, widening a rich edit box from 200 to 900: 'WM_WINDOWPOSCHANGED { ContentsResized (Control.Width=200, real window width=900)  WM_SIZE client=900 }'. The patch makes OnContentsResized begin by setting _newWidth to the window's real width (GetWindowRect), which is right in either order; if that call fails, _newWidth keeps its value. It adds two small methods to TextEditor, CitaviCrossover_WindowWidth and CitaviCrossover_GetWindowRect."
+    },
+    {
+      "id": "word-processor-caret-positions",
+      "kind": "complete-character-placement",
+      "assembly": "SwissAcademic.Controls.dll",
+      "type": "SwissAcademic.Controls.WordProcessor.COp+Win32",
+      "method": "GetCharacterPlacement",
+      "why": "On the Quotations & comments tab a quotation with formatted text flickers: its text box changes height several times a second (254 and 1107 pixels in turn, a scrollbar coming and going), the text is wrapped differently each time, down to one letter per line, and the rest of the tab is not redrawn. It happens when the text contains a character outside ASCII (a curly quote, a Greek word) or is set in a font that has Arabic or Hebrew letters (Arial, Times New Roman). Citavi's word processor (WordProcessorControl, the TE Edit Control) measures such text with GetCharacterPlacement(GCP_REORDER | GCP_GLYPHSHAPE) and takes each character's width from the caret positions it returns (lpCaretPos), unless the returned class (lpClass) marks the character as right-to-left. With GCP_REORDER Wine fills in neither, so both hold whatever the freshly allocated memory contained and the widths are random. Measured with a probe in the bottle: result buffers preset to CC come back with lpDx and lpOrder filled, lpCaretPos CCCCCCCC and lpClass CC; hosted alone, the text box wraps a text of 6 lines into 117 to 472 lines, different on every pass. In the list of quotations the box fits its height to its text and shows a scrollbar when the text does not fit, so each wrong measurement starts the next. The same code measures the text of every word processor field in Citavi. The patch sends the call through an added method that makes the call and then fills in both results: caret positions as the running sum of the widths in lpDx (what Wine itself returns when GCP_REORDER is not set), classes as 2 for Hebrew and Arabic characters and 1 (Latin) for all others. It adds two methods next to the declaration, CitaviCrossover_GetCharacterPlacement and CitaviCrossover_CharacterClass. With it the same text wraps into 6 lines once and stays."
+    },
+    {
+      "id": "task-slider-thumb",
+      "kind": "draw-trackbar-thumb",
+      "assembly": "Citavi.exe",
+      "type": "SwissAcademic.Citavi.Shell.Controls.TaskStateEditor",
+      "field": "trackBar",
+      "why": "On the Tasks & locations tab the slider that shows a task's state has a small white thumb with a thin grey outline, hard to see; on Windows it is a solid blue pointer. The slider is a standard Windows trackbar, which the theme draws. Wine's theme has a white, outlined thumb picture 13 x 21 pixels in size and draws it unstretched into the thumb's rectangle of 13 x 26 pixels (Retina mode, slider 36 pixels high); on Windows 10 the thumb is about 17 x 27 pixels and filled with blue. Measured with a probe in the bottle (thumb rectangle from TBM_GETTHUMBRECT, picture from a rendering of the control). A trackbar asks its parent before drawing each part (NM_CUSTOMDRAW), and Wine's does too. The patch gives the task state control a WndProc that answers for the thumb and fills the thumb's whole rectangle with a pointer in Windows 10's colours: blue (0, 120, 215), grey (204, 204, 204) while the task cannot be changed or the thumb is being dragged. If drawing fails, the slider draws its own thumb as before. It adds two methods to TaskStateEditor, WndProc and CitaviCrossover_DrawThumb. The track and the tick marks stay as Wine's theme draws them."
+    },
+    {
+      "id": "task-planner-slider-thumb",
+      "kind": "draw-trackbar-thumb",
+      "assembly": "Citavi.exe",
+      "type": "SwissAcademic.Citavi.Shell.Controls.TaskStateGridEditor",
+      "field": "trackBar",
+      "why": "In the Task Planner (the Tasks workspace, the list of all tasks) the Status column shows a task's state with the same slider and the same fault as in task-slider-thumb: a small white thumb, hard to see. It is another control, TaskStateGridEditor, and the list uses two of them (MainForm, taskPlanningTaskStateControlContainer): one that it paints into the cell of every row as a picture and whose window stays off screen (RenderingControl), and one that it places over the cell while that cell is being edited (EditingControl). Wine's trackbar asks its parent before drawing the thumb in both cases, also when it is painted into a picture, so the same added WndProc covers both. Checked in a bottle with Wine Stable 11.0 in Retina mode, slider 34 pixels high: a blue pointer of about 13 x 24 pixels in the row, in the cell being edited, and at the new place after the slider was moved. It adds two methods to TaskStateGridEditor, WndProc and CitaviCrossover_DrawThumb."
+    },
+    {
+      "id": "friendly-program-name",
+      "kind": "wide-character-call",
+      "assembly": "SwissAcademic.dll",
+      "type": "SwissAcademic.NativeMethods",
+      "method": "AssocQueryString",
+      "why": "The button that opens a web address or a file names the program in garbled letters: 'Open in h\u00aa\u013a\u017e\u00ffo' where Windows says 'Open in Microsoft Edge'. The button works. Citavi asks Windows for the friendly name of the program that opens .html files (Path2.GetExecutablesFriendlyName) with four calls of AssocQueryString: without a buffer to learn the size, with a buffer, and then both again, the third call passing no buffer but the size it just learned. Citavi's declaration does not say which text form to use, so .NET calls the single-byte form, AssocQueryStringA. Wine's AssocQueryStringA answers that third call with success and size 0 where the 16-bit form, AssocQueryStringW, answers 'buffer needed' and the size; the fourth call then gets a buffer of size 0 and Citavi reads back whatever the memory held. Measured with a probe in the bottle, the four calls for .html: single-byte 12, 'winebrowser', 0, six garbage characters; 16-bit 12, 'winebrowser', 12, 'winebrowser'. The patch makes the declaration ask for the 16-bit form. The name is then the one Wine gives: winebrowser, its helper that hands the address to the Mac's default browser."
+    },
+    {
+      "id": "browser-name",
+      "kind": "return-constant-for-argument",
+      "assembly": "SwissAcademic.dll",
+      "type": "System.IO.Path2",
+      "method": "GetExecutablesFriendlyName",
+      "when": ".html",
+      "value": "browser",
+      "why": "With friendly-program-name the button that opens a web address reads 'Open in winebrowser', where Windows names the browser ('Open in Microsoft Edge'). For every web address Citavi asks for the friendly name of the program that opens '.html' (UriUtility.GetExecutablesFriendlyName passes that literal). In a bottle that program is always winebrowser, Wine's helper that hands the address to the Mac's default browser, and the name Wine returns for it is the file name without its ending (measured with a probe: 'winebrowser' for .html, .pdf and http). The patch makes Citavi's function answer 'browser' for '.html' without asking. It is one word for every interface language. Other file types are not changed: a PDF's button still names winebrowser, which there stands for the Mac's default program for the file."
+    }
+  ]
+}

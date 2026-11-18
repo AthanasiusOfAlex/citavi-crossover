@@ -1,0 +1,11 @@
+build/
+work/
+.DS_Store
+resources/*.exe
+resources/*.msi
+resources/*.zip
+resources/dotnet/
+resources/*.etag
+resources/*.part
+__pycache__/
+obj/

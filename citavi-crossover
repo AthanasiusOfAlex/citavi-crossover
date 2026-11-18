@@ -1,0 +1,1534 @@
+#!/bin/zsh
+# citavi-crossover — install, patch and maintain Citavi 7 in a CrossOver or Wine bottle on Apple Silicon.
+# Run `./citavi-crossover help` for the command list; see README.md and docs/ADAPTING.md.
+
+set -u
+ROOT=${0:A:h}
+source "$ROOT/config.sh"
+
+CX="$CROSSOVER_APP/Contents/SharedSupport/CrossOver"
+BOTTLE="$BOTTLE_DIR/$BOTTLE_NAME"
+# ENGINE (config.sh) says what runs Windows programs: CrossOver, or Wine from winehq.org.
+WINE="$WINE_BIN/wine"; WINESERVER="$WINE_BIN/wineserver"
+case $ENGINE in
+  crossover) ENGINE_NAME=CrossOver; WIN_USER=crossover ;;
+  wine)      ENGINE_NAME=Wine;      WIN_USER=${USER:-$(id -un)} ;;
+  *) print -u2 -- "error: ENGINE must be crossover or wine, not '$ENGINE' (config.sh)"; exit 1 ;;
+esac
+WIN_HOME="$BOTTLE/drive_c/users/$WIN_USER"       # the Windows user's folder (AppData and so on)
+CITAVI_DIR="$BOTTLE/$CITAVI_UNIX_SUBDIR"
+BIN="$CITAVI_DIR/bin"
+CITAVI_EXE_WIN="$CITAVI_WIN_DIR\\bin\\Citavi.exe"
+STATE="$BOTTLE/drive_c/citavi-crossover"          # our own folder inside the bottle (backups, logs)
+STATE_WIN='C:\citavi-crossover'
+TOOLS="$STATE/tools"                              # our Windows programs and the rules, copied into the bottle
+TOOLS_WIN="$STATE_WIN\\tools"
+FRAMEWORK="$BOTTLE/drive_c/windows/Microsoft.NET/Framework64/v4.0.30319"
+WORK="$ROOT/work"
+PREBUILT="$ROOT/prebuilt"                          # ready-built helpers (see cmd_build)
+PATCHER_EXE="$PREBUILT/patcher/citavi-patcher.exe"
+WCLICK_EXE="$PREBUILT/wclick/wclick.exe"
+TRACE_DLL="$PREBUILT/trace/CitaviTrace.dll"
+HELPER_BIN="$PREBUILT/CitaviLoginHelper"
+WINLIST="$PREBUILT/winlist"
+BIN_WIN="$CITAVI_WIN_DIR\\bin"
+FRAMEWORK_WIN='C:\windows\Microsoft.NET\Framework64\v4.0.30319'
+DOTNET_CACHE="$ROOT/resources/dotnet"
+HELPER_NAME="Citavi Login Helper.app"
+HELPER_APP="$HELPER_INSTALL_DIR/$HELPER_NAME"
+HELPER_ID=org.citavi-crossover.login-helper
+HELPER_LOG="$HOME/Library/Logs/CitaviLoginHelper.log"
+LAUNCHER_NAME="Citavi 7.app"                       # Wine only: the app that starts Citavi (see launcher_install)
+LAUNCHER_APP="$HELPER_INSTALL_DIR/$LAUNCHER_NAME"
+LAUNCHER_ID=org.citavi-crossover.citavi
+TESTED_CITAVI=7.4.1.3                              # the Citavi version the fixes were last checked with
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_ROLL_FORWARD=Major
+export PATH="$PATH:$HOME/.dotnet/tools:/opt/homebrew/bin:/usr/local/share/dotnet"
+
+# ------------------------------------------------------------------ output helpers
+
+if [[ -t 1 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'; else B= G= Y= R= D= N=; fi
+step() { print -- "${B}==> $*${N}"; }
+ok()   { print -- "  ${G}ok${N}    $*"; }
+warn() { print -- "  ${Y}warn${N}  $*"; }
+bad()  { print -- "  ${R}FAIL${N}  $*"; }
+note() { print -- "        ${D}$*${N}"; }
+die()  { print -u2 -- "${R}error:${N} $*"; exit 1; }
+
+# ------------------------------------------------------------------ building blocks
+
+# ---- the engine layer: the only place that knows how CrossOver and Wine are called.
+#
+# bwine [options] program [arguments]: run a Windows program in the bottle and wait for it.
+#   -a            the program is an application, given by name or Windows path (CrossOver wants to know)
+#   -w            wait as well for every program it started
+#   -v <version>  the Windows version to show it (win7, winxp64 …)
+#   -d <list>     DLL overrides for it, e.g. "fusion=b"
+#   -l <file>     write the engine's own messages (err: lines and the like) into this file
+# With Wine, -v changes the bottle's Windows version for the time of the run, and -w waits until
+# nothing is running in the bottle any more.
+WINE_QUIET=(WINEDEBUG=-all)
+WINE_NOMENU='winemenubuilder.exe=d'   # Wine's menu builder writes Linux desktop files into the home folder
+bwine() {
+  local app=0 wait=0 winver= dlls= log= rc
+  while [[ "${1:-}" == -[awvdl] ]]; do
+    case $1 in
+      -a) app=1 ;; -w) wait=1 ;;
+      -v) winver=$2; shift ;; -d) dlls=$2; shift ;; -l) log=$2; shift ;;
+    esac
+    shift
+  done
+  if [[ $ENGINE == crossover ]]; then
+    local o=()
+    [[ -n "$winver" ]] && o+=(--winver "$winver")
+    (( wait )) && o+=(--wait-children)
+    [[ -n "$dlls" ]] && o+=(--dll "$dlls")
+    [[ -n "$log" ]] && o+=(--cx-log "$log" --debugmsg "${CXDEBUG:-err+all,fixme-all}")
+    (( app )) && o+=(--cx-app)
+    CX_BOTTLE_PATH="$BOTTLE_DIR" "$CX/bin/wine" --bottle "$BOTTLE_NAME" $o "$@"
+    return
+  fi
+  [[ -n "$winver" ]] && wine_winver "$winver"
+  local e=(WINEPREFIX="$BOTTLE" WINEDLLOVERRIDES="$WINE_NOMENU${dlls:+;$dlls}")
+  if [[ -n "$log" ]]; then env $e WINEDEBUG="${CXDEBUG:-err+all,fixme-all}" "$WINE" "$@" 2> "$log"
+  else env $e $WINE_QUIET "$WINE" "$@"; fi
+  rc=$?
+  (( wait )) && wine_idle
+  [[ -n "$winver" ]] && wine_winver win10
+  return $rc
+}
+wine_idle()   { env WINEPREFIX="$BOTTLE" "$WINESERVER" -w 2>/dev/null; }      # returns when the bottle is at rest
+wine_winver() { env WINEPREFIX="$BOTTLE" WINEDLLOVERRIDES="$WINE_NOMENU" $WINE_QUIET "$WINE" winecfg /v "$1" >/dev/null 2>&1; }
+
+# A bottle belongs to the engine that made it; CrossOver's has a cxbottle.conf, Wine's has not.
+# Running one engine on the other's bottle would convert it, so every command refuses.
+bottle_kind() { [[ -f "$BOTTLE/cxbottle.conf" ]] && print crossover || print wine; }
+need_own_bottle() {
+  local kind; kind=$(bottle_kind)
+  [[ "$kind" == "$ENGINE" ]] && return 0
+  local other=CrossOver; [[ "$kind" == wine ]] && other=Wine
+  die "the bottle at $BOTTLE was made by $other, and this run uses $ENGINE_NAME.
+Use it with:  CITAVI_ENGINE=$kind citavi-crossover …   or give the $ENGINE_NAME bottle another name (CITAVI_BOTTLE)."
+}
+bottle_mark() { mkdir -p "$STATE"; print -- "This bottle was created by citavi-crossover on $(date)." > "$STATE/created-by-setup"; }
+bottle_create() {   # a new, empty Windows 10 (64-bit) bottle
+  if [[ $ENGINE == crossover ]]; then
+    CX_BOTTLE_PATH="$BOTTLE_DIR" "$CX/bin/cxbottle" --bottle "$BOTTLE_NAME" --create --template win10_64 \
+      --description "Citavi 7, set up by citavi-crossover" >/dev/null 2>&1 || return 1
+  else
+    mkdir -p "$BOTTLE_DIR" || return 1
+    env WINEPREFIX="$BOTTLE" WINEDLLOVERRIDES="$WINE_NOMENU" $WINE_QUIET "$WINE" wineboot --init >/dev/null 2>&1
+    wine_idle
+    [[ -f "$BOTTLE/system.reg" && -d "$BOTTLE/drive_c/windows" ]] || return 1
+    # The same switch-off as WINE_NOMENU, kept in the bottle for programs started in other ways.
+    bwine reg add 'HKCU\Software\Wine\DllOverrides' /v winemenubuilder.exe /t REG_SZ /d '' /f >/dev/null 2>&1
+  fi
+  bottle_mark
+}
+# Deletes the bottle for good. The caller has made sure that it may go: it carries our
+# created-by-setup mark, or the user typed its name (cmd_uninstall).
+bottle_delete() {
+  [[ -n "$BOTTLE_NAME" && "$BOTTLE" == "$BOTTLE_DIR/$BOTTLE_NAME" && -f "$BOTTLE/system.reg" ]] || return 1
+  if [[ $ENGINE == crossover ]]; then
+    CX_BOTTLE_PATH="$BOTTLE_DIR" "$CX/bin/cxbottle" --bottle "$BOTTLE_NAME" --delete --force >/dev/null 2>&1
+  else
+    env WINEPREFIX="$BOTTLE" "$WINESERVER" -k 2>/dev/null; pause 2
+    rm -rf "${BOTTLE:?}"
+  fi
+  [[ ! -d "$BOTTLE" ]]
+}
+bottle_reboot() {   # what a restart of Windows does: finishes what installers left for "after restart"
+  if [[ $ENGINE == crossover ]]; then CX_BOTTLE_PATH="$BOTTLE_DIR" "$CX/bin/cxreboot" --bottle "$BOTTLE_NAME" >/dev/null 2>&1
+  else bwine wineboot -r >/dev/null 2>&1; wine_idle; fi
+}
+# start_citavi <log file or ''> [arguments]: starts Citavi and returns at once. TRACE_ENV is passed on.
+start_citavi() {
+  local log=$1; shift
+  if [[ $ENGINE == crossover ]]; then
+    local o=(); [[ -n "$log" ]] && o=(--cx-log "$log" --debugmsg "${CXDEBUG:-err+all,fixme-all}")
+    ( nohup env CX_BOTTLE_PATH="$BOTTLE_DIR" $TRACE_ENV "$CX/bin/wine" --bottle "$BOTTLE_NAME" $o --cx-app "$CITAVI_EXE_WIN" "$@" >/dev/null 2>&1 & )
+  elif [[ -n "$log" ]]; then
+    ( cd "$BIN" && nohup env WINEPREFIX="$BOTTLE" WINEDLLOVERRIDES="$WINE_NOMENU" WINEDEBUG="${CXDEBUG:-err+all,fixme-all}" $TRACE_ENV \
+        "$WINE" "$CITAVI_EXE_WIN" "$@" >/dev/null 2>"$log" & )
+  else
+    ( cd "$BIN" && nohup env WINEPREFIX="$BOTTLE" WINEDLLOVERRIDES="$WINE_NOMENU" $WINE_QUIET $TRACE_ENV "$WINE" "$CITAVI_EXE_WIN" "$@" >/dev/null 2>&1 & )
+  fi
+}
+
+winpath() { print -r -- "Z:${1//\//\\}"; }                 # /a/b -> Z:\a\b (Z: is / in every bottle)
+# Is Citavi running in this bottle? macOS shows that a Citavi.exe is running somewhere, but not
+# in which bottle, so the bottle is asked for its own list of programs. A Citavi in another
+# bottle (CrossOver's next to Wine's, say) is none of this run's business.
+citavi_running() {
+  pgrep -f 'Citavi\.exe' >/dev/null 2>&1 || return 1
+  [[ -d "$BOTTLE/drive_c" ]] || return 1
+  bwine tasklist 2>/dev/null | grep -q -i '^Citavi\.exe'
+}
+citavi_installed() { [[ -f "$BIN/Citavi.exe" ]]; }
+pause() { perl -e "select(undef,undef,undef,$1)"; }
+
+need_engine() {
+  if [[ $ENGINE == crossover ]]; then [[ -x "$CX/bin/wine" ]] || die "CrossOver not found at $CROSSOVER_APP (edit config.sh)"
+  else [[ -x "$WINE" && -x "$WINESERVER" ]] || die "Wine not found (run: citavi-crossover preflight)"; fi
+}
+need_bottle()    { need_engine; [[ -d "$BOTTLE/drive_c" ]] || die "bottle '$BOTTLE_NAME' not found in $BOTTLE_DIR — run: citavi-crossover setup"; need_own_bottle; }
+need_citavi()    { need_bottle; citavi_installed || die "Citavi is not installed in the bottle — run: citavi-crossover setup"; }
+need_closed() {
+  citavi_running || return 0
+  if [[ "${FORCE:-0}" == 1 ]]; then bwine taskkill /f /im Citavi.exe >/dev/null 2>&1; pause 2; return 0; fi
+  die "Citavi is running. Quit it first (or add --force to close it without saving)."
+}
+
+# plain_copy <from> <to>: the file's contents and nothing else. A folder downloaded with a browser
+# has macOS's "downloaded from the internet" mark on every file, and cp carries it along (even
+# cp -X). macOS refuses to start a program with that mark unless a registered developer signed it,
+# which our small helpers are not; so they are put in place without it. (Windows programs are not
+# affected: macOS does not check what runs inside a bottle.)
+plain_copy() { cat "$1" > "$2"; }
+
+# confirm <question>: true on yes. --yes answers every question in advance.
+confirm() {
+  (( ASSUME_YES )) && return 0
+  [[ -t 0 ]] || die "this step needs a yes or no from you: run it in a terminal window, or add --yes to agree in advance"
+  local a; read "a?$1 [y/N] "; [[ "$a" == [yY]* ]]
+}
+
+# fetch <url> <file> [sha256]: download with a progress bar, picking up a broken download where it
+# stopped. The file only gets its final name once it is complete (and matches the checksum, if given).
+fetch() {
+  local url=$1 dst=$2 sha=${3:-} have
+  mkdir -p "${dst:h}"
+  curl -L --fail --retry 3 --retry-delay 3 -C - --progress-bar -o "$dst.part" "$url" \
+    || { rm -f "$dst.part"; curl -L --fail --retry 3 --retry-delay 3 --progress-bar -o "$dst.part" "$url"; } \
+    || { rm -f "$dst.part"; return 1; }
+  if [[ -n "$sha" ]]; then
+    have=$(shasum -a 256 "$dst.part" | cut -d' ' -f1)
+    [[ "$have" == "$sha" ]] || { rm -f "$dst.part"; print -u2 -- "        checksum mismatch for ${dst:t}: expected $sha, got $have"; return 2; }
+  fi
+  mv -f "$dst.part" "$dst"
+}
+
+# The helpers are shipped ready-built in prebuilt/, so that a Mac needs nothing but CrossOver or Wine.
+# prebuilt/SOURCES.sha256 records the sources they were built from; if a source has changed since,
+# the binaries are stale and `citavi-crossover build` (which needs the developer tools) rebuilds them.
+PREBUILT_CHECKED=0
+need_prebuilt() {
+  (( PREBUILT_CHECKED )) && return 0
+  [[ -f "$PATCHER_EXE" && -f "$PREBUILT/SOURCES.sha256" ]] \
+    || die "the ready-built helpers are missing from $PREBUILT — get the complete folder again, or run: citavi-crossover build"
+  ( cd "$ROOT" && shasum -a 256 -c --status prebuilt/SOURCES.sha256 2>/dev/null ) \
+    || die "a helper's source code has changed since prebuilt/ was built — run: citavi-crossover build"
+  PREBUILT_CHECKED=1
+}
+# Windows programs are run from inside the bottle (C:\citavi-crossover), never from this folder.
+# A folder in Downloads, Documents or on the Desktop is protected by macOS, and a bottle that
+# CrossOver itself started would not be allowed to read it; the bottle's own files always work.
+# stage_tools copies the patcher, the window helper and the rules there; stage_file copies one
+# installer (as an instant copy-on-write clone when the disk allows) and prints its Windows path.
+stage_tools() {
+  need_prebuilt
+  mkdir -p "$TOOLS"
+  if ! cmp -s "$PREBUILT/SOURCES.sha256" "$TOOLS/SOURCES.sha256"; then
+    cp "$PREBUILT"/patcher/* "$PREBUILT"/wclick/* "$TOOLS/" && cp "$PREBUILT/SOURCES.sha256" "$TOOLS/" \
+      || die "could not copy the helpers into the bottle ($TOOLS)"
+  fi
+  cmp -s "$ROOT/patches/rules.json" "$TOOLS/rules.json" || cp "$ROOT/patches/rules.json" "$TOOLS/rules.json"
+}
+stage_file() {
+  mkdir -p "$STATE/installers"
+  local dst="$STATE/installers/${1:t}"
+  rm -f "$dst"
+  cp -c "$1" "$dst" 2>/dev/null || cp "$1" "$dst" || die "could not copy ${1:t} into the bottle"
+  print -r -- "$STATE_WIN\\installers\\${1:t}"
+}
+unstage_files() { rm -rf "$STATE/installers"; }
+
+# The patcher is a .NET Framework program: it runs on the bottle's own .NET, so the Mac needs none.
+# Every path it is given must be a Windows path; the rules are $RULES_WIN.
+RULES_WIN="$TOOLS_WIN\\rules.json"
+patcher() { stage_tools; bwine "$TOOLS_WIN\\citavi-patcher.exe" "$@" 2>/dev/null | tr -d '\r'; return ${pipestatus[1]}; }
+
+# The exception tracer: a DLL the .NET runtime loads into Citavi when two environment variables
+# are set. It writes every exception Citavi throws, caught or not, to a file. Citavi is not modified.
+# trace_on <name>: fills TRACE_ENV for the next Citavi start; the trace lands in $STATE/logs/<name>.
+trace_on() {
+  need_prebuilt
+  cmp -s "$TRACE_DLL" "$BIN/CitaviTrace.dll" || cp "$TRACE_DLL" "$BIN/CitaviTrace.dll"
+  mkdir -p "$STATE/logs"
+  # Only Citavi may see these: any other .NET program started with them (wclick, say) fails to load.
+  TRACE_ENV=(APPDOMAIN_MANAGER_ASM='CitaviTrace, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null'
+             APPDOMAIN_MANAGER_TYPE='CitaviTrace.Manager'
+             CITAVI_TRACE_FILE="$STATE_WIN\\logs\\$1")
+}
+TRACE_ENV=()
+latest_trace() { ls -t "$STATE/logs"/trace-*.log 2>/dev/null | head -1; }
+# trace_summary <file> [max]: one line per distinct exception, in the order they first happened.
+trace_summary() {
+  grep -a -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+ \[t[0-9]+\] ' "$1" | sed -E 's/^[^]]*\] (\(x[0-9]+\) )?//' | cut -c1-170 \
+    | awk '!seen[$0]++' | head -${2:-15} | sed 's/^/        /'
+}
+
+wclick() { stage_tools; bwine "$TOOLS_WIN\\wclick.exe" "$@" 2>/dev/null | tr -d '\r'; }
+
+CITAVI_VERSION=
+citavi_version() {  # asked of Citavi.exe once per run (it takes a few seconds)
+  [[ -n "$CITAVI_VERSION" ]] || CITAVI_VERSION=$(patcher info "$BIN_WIN" | tail -1)
+  print -r -- "$CITAVI_VERSION"
+}
+
+# Reads patches/registry.conf and calls: <callback> id key name type data why
+each_registry_fix() {
+  local cb=$1 line id key name type data why
+  while IFS= read -r line; do
+    [[ -z "${line// }" || "$line" == \#* ]] && continue
+    id=${${line%% | *}// }; line=${line#* | }
+    key=${line%% | *};      line=${line#* | }
+    name=${line%% | *};     line=${line#* | }
+    type=${line%% | *};     line=${line#* | }
+    data=${line%% | *};     why=${line#* | }
+    $cb "$id" "$key" "$name" "$type" "$data" "$why"
+  done < "$ROOT/patches/registry.conf"
+}
+# "Segoe UI 9" -> the LOGFONTW structure (as hex) in which Windows stores a system font:
+# height in points, weight 400, default character set, face name in UTF-16.
+logfont_hex() {
+  local pt=${1##* } face=${1% *} hex i
+  hex="$(printf '%02X000000' $pt)000000000000000000000000900100000000000100000000"
+  for (( i = 1; i <= ${#face}; i++ )); do hex+=$(printf '%02X00' "'${face[i]}"); done
+  print -r -- "${(r:184::0:)hex}"
+}
+views_for() { [[ "$1" == HKLM* ]] && print -- "/reg:64 /reg:32" || print -- "/reg:64"; }
+
+apply_fix() {
+  local id=$1 key=$2 name=$3 type=$4 data=$5 v
+  [[ "$type" == FONT ]] && { type=REG_BINARY; data=$(logfont_hex "$data"); }
+  for v in $(views_for "$key"); do
+    if [[ "$type" == KEY ]]; then bwine reg add "$key" /f $v >/dev/null 2>&1
+    else bwine reg add "$key" /v "$name" /t "$type" /d "$data" /f $v >/dev/null 2>&1; fi || { bad "$id ($v)"; return 1; }
+  done
+  ok "$id"
+}
+
+FIX_PROBLEMS=0
+check_fix() {
+  local id=$1 key=$2 name=$3 type=$4 data=$5 v out have shown=$5
+  [[ "$type" == FONT ]] && { type=REG_BINARY; data=$(logfont_hex "$data"); }
+  for v in $(views_for "$key"); do
+    if [[ "$type" == KEY ]]; then
+      bwine reg query "$key" $v >/dev/null 2>&1 || { bad "registry: $id — key missing"; FIX_PROBLEMS=$((FIX_PROBLEMS+1)); return; }
+    else
+      out=$(bwine reg query "$key" /v "$name" $v 2>/dev/null | tr -d '\r' | grep -F "$type")
+      have=${out##*$type}; have=${have#"${have%%[![:space:]]*}"}
+      [[ "$type" == REG_DWORD && -n "$have" ]] && have=$((have))
+      if [[ "$have" != "$data" ]]; then
+        [[ "$type" == REG_BINARY ]] && have=${have:+something else}
+        bad "registry: $id — expected $shown, found '${have:-nothing}' ($v)"; FIX_PROBLEMS=$((FIX_PROBLEMS+1)); return
+      fi
+    fi
+  done
+  ok "registry: $id"
+}
+
+# Retina mode is a setting (RETINA in config.sh), not a fixed repair, so it lives here and not in
+# registry.conf. These are the two values CrossOver's own "High Resolution Mode" switch writes:
+# the Mac driver draws at full pixel resolution, and Windows' DPI doubles so nothing shrinks.
+each_display_fix() {
+  local cb=$1
+  if [[ "$RETINA" == on ]]; then
+    $cb retina-mode 'HKCU\Software\Wine\Mac Driver' RetinaMode REG_SZ y
+    $cb retina-dpi 'HKCU\Control Panel\Desktop' LogPixels REG_DWORD 192
+  else
+    $cb retina-mode-off 'HKCU\Software\Wine\Mac Driver' RetinaMode REG_SZ n
+    $cb retina-dpi-off 'HKCU\Control Panel\Desktop' LogPixels REG_DWORD 96
+  fi
+}
+
+# ------------------------------------------------------------------ commands
+
+# Developer tools. Nobody needs these to install or run Citavi: only to rebuild the helpers in
+# prebuilt/ after changing their source, or to investigate a new Citavi version (docs/ADAPTING.md).
+cmd_deps() {
+  step "Developer tools (only for working on this tool; not needed to install or run Citavi)"
+  command -v dotnet >/dev/null && ok ".NET SDK $(dotnet --version 2>/dev/null)" || { warn ".NET SDK missing — needed by 'build'"; note "brew install --cask dotnet-sdk"; }
+  command -v swiftc >/dev/null && ok "Swift compiler" || { warn "swiftc missing — needed by 'build'"; note "xcode-select --install"; }
+  if ! command -v ilspycmd >/dev/null && command -v dotnet >/dev/null; then
+    note "installing ILSpy command line (ilspycmd)…"; dotnet tool install -g ilspycmd >/dev/null 2>&1
+  fi
+  command -v ilspycmd >/dev/null && ok "ILSpy decompiler (ilspycmd)" || warn "ilspycmd missing — only needed for 'decompile'"
+  if ! command -v msiinfo >/dev/null && command -v brew >/dev/null; then
+    note "installing msitools…"; HOMEBREW_NO_AUTO_UPDATE=1 brew install msitools >/dev/null 2>&1
+  fi
+  command -v msiinfo >/dev/null && ok "msitools (msiinfo, msiextract)" || warn "msitools missing — only needed to inspect an installer without installing it"
+}
+
+# Rebuilds everything in prebuilt/ from source and records which sources it was built from.
+PREBUILT_SOURCES=(patcher/Program.cs patcher/patcher.csproj dev/trace/Trace.cs dev/trace/CitaviTrace.csproj
+                  dev/wclick/Program.cs dev/wclick/wclick.csproj login-helper/main.swift dev/winlist.swift)
+cmd_build() {
+  command -v dotnet >/dev/null || die "the .NET SDK is required to build (brew install --cask dotnet-sdk)"
+  command -v swiftc >/dev/null || die "the Swift compiler is required to build (xcode-select --install)"
+  local proj name out
+  for proj name in patcher patcher  dev/trace trace  dev/wclick wclick; do
+    step "Building $name"
+    rm -rf "$PREBUILT/$name"
+    out=$(cd "$ROOT/$proj" && dotnet build -c Release -p:DebugType=none -o "$PREBUILT/$name" 2>&1)
+    rm -rf "$ROOT/$proj/bin" "$ROOT/$proj/obj"
+    [[ "$out" == *"Build succeeded"* ]] || { print -r -- "$out" | grep -E "error" | sort -u | head -20; die "$name build failed"; }
+    ok "prebuilt/$name"
+  done
+  step "Building the login helper and the window lister"
+  swiftc -O -target arm64-apple-macos12.0 -o "$HELPER_BIN" "$ROOT/login-helper/main.swift" || die "login helper build failed"
+  swiftc -O -target arm64-apple-macos12.0 -o "$WINLIST" "$ROOT/dev/winlist.swift" || die "winlist build failed"
+  ok "prebuilt/CitaviLoginHelper, prebuilt/winlist"
+  ( cd "$ROOT" && shasum -a 256 $PREBUILT_SOURCES > prebuilt/SOURCES.sha256 ) || die "could not write prebuilt/SOURCES.sha256"
+  ok "prebuilt/SOURCES.sha256"
+  note "installed copies are refreshed by: citavi-crossover helper   (login helper)"
+}
+
+# Everything that must be true of this Mac before anything is installed.
+cmd_preflight() {
+  step "This Mac"
+  [[ "$(uname -m)" == arm64 ]] && ok "Apple Silicon, macOS $(sw_vers -productVersion 2>/dev/null)" \
+    || warn "this is not an Apple Silicon Mac; the tool has only been tested on Apple Silicon"
+  if [[ $ENGINE == crossover ]]; then
+    if [[ ! -x "$CX/bin/wine" ]]; then
+      bad "CrossOver is not installed (looked for $CROSSOVER_APP)"
+      print -- "
+  1. Download CrossOver from https://www.codeweavers.com/crossover and move it to Applications.
+  2. Open it once and answer its questions (free trial or your licence; it may ask to install Rosetta).
+  3. Run this command again."
+      exit 1
+    fi
+    ok "CrossOver $(defaults read "$CROSSOVER_APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null) at $CROSSOVER_APP"
+    if ! defaults read com.codeweavers.CrossOver FirstRunDate >/dev/null 2>&1; then
+      bad "CrossOver has never been opened on this Mac"
+      print -- "
+  Open CrossOver once and answer its questions (free trial or your licence), quit it,
+  then run this command again."
+      exit 1
+    fi
+  else
+    local wineapp=${WINE_BIN%/Contents/Resources/*} ver
+    [[ "$wineapp" == *.app ]] || wineapp="/Applications/Wine Stable.app"
+    if [[ ! -x "$WINE" || ! -x "$WINESERVER" ]]; then
+      bad "Wine is not installed"
+      print -- "
+  1. Install Wine Stable. With Homebrew:   brew install --cask wine-stable
+     Without: the macOS page of https://gitlab.winehq.org/wine/wine/-/wikis/Download links to it.
+  2. macOS marks every downloaded app, and refuses to start one that no registered developer
+     signed. Wine is not signed, so take the mark off:
+       xattr -dr com.apple.quarantine \"$wineapp\"
+  3. Run this command again."
+      exit 1
+    fi
+    ver=$("$WINE" --version 2>/dev/null)
+    if [[ -z "$ver" ]]; then
+      bad "Wine is installed at $wineapp, but macOS does not let it start"
+      print -- "
+  macOS marks every downloaded app, and refuses to start one that no registered developer
+  signed. Wine is not signed, so take the mark off, then run this command again:
+    xattr -dr com.apple.quarantine \"$wineapp\""
+      exit 1
+    fi
+    ok "Wine ${ver#wine-} at $wineapp"
+    ver=${ver#wine-}
+    if [[ "$ver" == <->.<->* ]] && (( ${ver%%.*} < 10 || ( ${ver%%.*} == 10 && ${${ver#*.}%%[^0-9]*} < 5 ) )); then
+      warn "this Wine is older than 10.5; Microsoft's .NET Framework is reported not to work in it"
+    fi
+  fi
+  if [[ ! -e /Library/Apple/usr/libexec/oah/libRosettaRuntime ]]; then
+    bad "Rosetta is not installed ($ENGINE_NAME needs it to run Windows programs)"
+    print -- "
+  Install it with this command (it asks you to agree to Apple's licence), then run this again:
+    softwareupdate --install-rosetta"
+    exit 1
+  fi
+  ok "Rosetta"
+  local dir="$BOTTLE_DIR" free
+  while [[ ! -d "$dir" && "$dir" != / ]]; do dir=${dir:h}; done
+  if [[ "$BOTTLE_DIR" == /Volumes/* && "$dir" == /Volumes ]]; then
+    bad "the bottle folder $BOTTLE_DIR is on a disk that is not connected"; exit 1
+  fi
+  [[ -w "$dir" ]] || { bad "no permission to write in $dir (bottle folder: $BOTTLE_DIR)"; exit 1; }
+  ok "bottle folder $BOTTLE_DIR"
+  free=$(( $(df -k "$dir" | awk 'NR==2 {print $4}') / 1048576 ))
+  if [[ ! -d "$BOTTLE/drive_c" ]] && (( free < 6 )); then
+    bad "only $free GB free on that disk; a new Citavi bottle needs about 6 GB while it is being set up"; exit 1
+  fi
+  ok "$free GB free"
+  need_prebuilt; ok "ready-built helpers"
+}
+
+# True when the bottle holds Microsoft's real .NET Framework 4.8 (or a newer 4.x). A new CrossOver
+# bottle already has a v4.0.30319 folder and registry values, but they belong to Wine Mono, an
+# open-source stand-in that cannot run Citavi; only Microsoft's own has clr.dll.
+# dotnet_files_ok looks at files only. The registry file can be half a minute behind a bottle that
+# has just been changed, so dotnet_ok asks the bottle itself when the files do not say yes.
+dotnet_files_ok() {
+  [[ -f "$FRAMEWORK/clr.dll" ]] && grep -a -q '"DisplayName"="Microsoft .NET Framework 4\.[89]' "$BOTTLE/system.reg" 2>/dev/null
+}
+dotnet_release() {  # the .NET 4.x release number the bottle reports (0 if none); 528040 and up is 4.8
+  local v; v=$(bwine reg query 'HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' /v Release /reg:64 2>/dev/null | tr -d '\r' | grep -F REG_DWORD)
+  v=${${v##*REG_DWORD}// /}; print -- $(( ${v:-0} ))
+}
+dotnet_ok() {
+  dotnet_files_ok && return 0
+  [[ -f "$FRAMEWORK/clr.dll" ]] && (( $(dotnet_release) >= 528040 ))
+}
+crossover_running() { pgrep -f "$CROSSOVER_APP/Contents/MacOS/CrossOver" >/dev/null 2>&1; }
+installers_running() { pgrep -f 'ndp48-x86-x64|dotNetFx40_Full|dotnetfx|NetFx|\\Setup\.exe|msiexec\.exe' >/dev/null 2>&1; }
+
+cmd_bottle() {
+  need_engine
+  step "Bottle '$BOTTLE_NAME' ($ENGINE_NAME)"
+  local template="$BOTTLE_DIR/$TEMPLATE_BOTTLE"
+  if [[ -d "$BOTTLE/drive_c" ]]; then need_own_bottle; ok "exists at $BOTTLE"
+  elif [[ -e "$BOTTLE" ]]; then die "$BOTTLE exists but is not a bottle — move it away or choose another name (CITAVI_BOTTLE)"
+  elif [[ $ENGINE == crossover && -n "$TEMPLATE_BOTTLE" && -f "$template/drive_c/windows/Microsoft.NET/Framework64/v4.0.30319/clr.dll" ]]; then
+    note "copying the template bottle '$TEMPLATE_BOTTLE' (about 2 minutes)…"
+    CX_BOTTLE_PATH="$BOTTLE_DIR" "$CX/bin/cxbottle" --bottle "$BOTTLE_NAME" --copy "$TEMPLATE_BOTTLE" >/dev/null 2>&1 \
+      || die "cxbottle --copy failed"
+    bottle_mark
+    ok "created from '$TEMPLATE_BOTTLE'"
+  else
+    note "creating a new Windows 10 (64-bit) bottle…"
+    bottle_create || die "could not create the bottle at $BOTTLE"
+    ok "created at $BOTTLE"
+  fi
+  if dotnet_ok; then ok "Microsoft .NET Framework 4.8 is present"; else cmd_dotnet; fi
+}
+
+# ---- Microsoft .NET Framework 4.8
+#
+# CrossOver has a package for this ("Microsoft .NET Framework 4.8"), but it can only be installed
+# from CrossOver's window. So this does what that package does, as recorded in CrossOver's own
+# catalogue (~/Library/Application Support/CrossOver/tie/crossover.tie, entries
+# com.codeweavers.c4.5917 for .NET 4.0 and com.codeweavers.c4.16255 for .NET 4.8):
+# set mscoree to "native", then run Microsoft's installers for 4.0 and 4.8, each under the Windows
+# version and DLL overrides the catalogue names, with a simulated reboot after each.
+# Three things differ from CrossOver's package:
+#   - The installers run with Microsoft's silent switches, so nothing has to be clicked.
+#   - Wine Mono is removed first. Otherwise the 4.0 installer sees Mono's registry values, decides a
+#     newer .NET is already there, and installs nothing (CrossOver's installer removes it too).
+#   - .NET 2.0, which the catalogue installs before 4.0, is left out: Citavi does not use it, and its
+#     download is a link into the Internet Archive that often refuses requests.
+# Wine 11.0 on a Mac cannot run 32-bit .NET programs: they hang when they start. 64-bit ones run,
+# and Citavi is one. CrossOver runs both. For this recipe it means two things, both about .NET's
+# "native images" (copies of its libraries compiled ahead of time, so that programs start faster):
+#   - C:\windows\assembly has to exist. A Wine bottle has none once Wine Mono is gone, and the
+#     compiler then fails every library with "Path not found" and tries again without end.
+#   - The 32-bit compiler is one of the programs that hang, and Microsoft's installer waits for it.
+#     ngen32_watch notices a worker that has run for 90 seconds, notes that in the bottle
+#     ($NGEN32_MARK) and from then on stops the 32-bit compiler as soon as it appears. Afterwards
+#     its Windows service is switched off. The 64-bit compiler works and is left alone.
+#   A Wine that runs 32-bit .NET never trips the watch, and the recipe is then CrossOver's.
+#
+# One line per installer:  name | file | SHA-256 | URL | Windows version | DLL overrides | arguments (;-separated)
+DOTNET_STEPS=(
+  'Microsoft .NET Framework 4.0|dotNetFx40_Full_x86_x64.exe|65e064258f2e418816b304f646ff9e87af101e4c9552ab064bb74d281c38659f|https://download.microsoft.com/download/9/5/A/95A9616B-7A37-4AF6-BC36-D6EA96C8DAAE/dotNetFx40_Full_x86_x64.exe|winxp|fusion=b|/q;/c:install.exe /q'
+  'Microsoft .NET Framework 4.8|ndp48-x86-x64-allos-enu.exe|95889d6de3f2070c07790ad6cf2000d33d9a1bdfc6a381725ab82ab1c314fd53|https://download.visualstudio.microsoft.com/download/pr/7afca223-55d2-470a-8edc-6a1739ae3252/abd170b4b0ec15ad0222a809b761a036/ndp48-x86-x64-allos-enu.exe|win7||/sfxlang:1027;/q;/norestart'
+)
+NGEN32_WORKER='Microsoft\.NET\\Framework\\v4\.0\.30319\\mscorsvw\.exe -UseCLSID'
+NGEN32_RUN='Microsoft\.NET\\Framework\\v4\.0\.30319\\(ngen\.exe executeQueuedItems|mscorsvw\.exe -UseCLSID)'
+NGEN32_ALL='Microsoft\.NET\\Framework\\v4\.0\.30319\\(ngen|mscorsvw)\.exe'
+NGEN32_MARK="$STATE/logs/dotnet32-hangs"
+ngen32_watch() {   # runs until killed
+  local pid t
+  while true; do
+    if [[ -f "$NGEN32_MARK" ]]; then pkill -f "$NGEN32_RUN" 2>/dev/null
+    else
+      for pid in $(pgrep -f "$NGEN32_WORKER"); do
+        t=(${(s.:.)${$(ps -o etime= -p $pid 2>/dev/null)// /}})          # mm:ss, or hh:mm:ss
+        (( ${#t} > 2 || ( ${#t} == 2 && 10#${t[1]} * 60 + 10#${t[2]} >= 90 ) )) || continue
+        print -- "A 32-bit .NET compiler worker ran for over 90 seconds on $(date)." > "$NGEN32_MARK"
+        break
+      done
+    fi
+    pause 3
+  done
+}
+ngen32_off() {     # 4 = disabled: the service would start with the bottle and run for ever
+  bwine reg add 'HKLM\System\CurrentControlSet\Services\clr_optimization_v4.0.30319_32' /v Start /t REG_DWORD /d 4 /f >/dev/null 2>&1
+  pkill -f "$NGEN32_ALL" 2>/dev/null
+  return 0
+}
+
+# True when 32-bit .NET programs run in the bottle (see above: under Wine 11.0 on a Mac they hang).
+# The test program is InstallUtil.exe, a small 32-bit .NET program that comes with the .NET
+# Framework; asked for its help text it prints it and ends within a second or two.
+DOTNET32=
+dotnet32_works() {
+  if [[ -z "$DOTNET32" ]]; then
+    if [[ $ENGINE == crossover ]]; then DOTNET32=1
+    elif [[ -f "$NGEN32_MARK" ]]; then DOTNET32=0
+    else
+      local out="$STATE/logs/dotnet32-test.txt" pid i=0
+      mkdir -p "$STATE/logs"; rm -f "$out"
+      ( bwine 'C:\windows\Microsoft.NET\Framework\v4.0.30319\InstallUtil.exe' '/?' > "$out" 2>&1 ) &
+      pid=$!
+      while kill -0 $pid 2>/dev/null && (( i++ < 30 )); do pause 1; done
+      if kill -0 $pid 2>/dev/null; then
+        pkill -f 'Framework\\v4\.0\.30319\\InstallUtil\.exe' 2>/dev/null; wait $pid 2>/dev/null
+        DOTNET32=0; print -- "InstallUtil.exe (32-bit .NET) did not answer within 30 seconds on $(date)." > "$NGEN32_MARK"
+      elif grep -a -q -i 'installation utility' "$out"; then DOTNET32=1
+      else DOTNET32=0; fi
+    fi
+  fi
+  (( DOTNET32 ))
+}
+
+DOTNET_LICENCE_OK=0
+dotnet_licence() {
+  (( DOTNET_LICENCE_OK )) && return 0
+  print -- "
+  Microsoft .NET Framework 4.0 and 4.8 will be downloaded from Microsoft (about 120 MB) and
+  installed without showing Microsoft's licence screens. Going on means you accept
+  Microsoft's licence terms for the .NET Framework."
+  [[ $ENGINE == crossover ]] && print -- "  (To read and accept them on screen instead, answer n and run:  citavi-crossover setup --guided)"
+  confirm "  Install .NET Framework and accept Microsoft's licence terms?" || return 1
+  DOTNET_LICENCE_OK=1
+}
+
+cmd_dotnet() {
+  need_bottle
+  if (( GUIDED )); then
+    [[ $ENGINE == crossover ]] || die "--guided uses CrossOver's own installer window; Wine has none"
+    dotnet_guided; return
+  fi
+  step "Microsoft .NET Framework 4.8 (about 5 minutes)"
+  if dotnet_ok; then ok "already in the bottle"; return 0; fi
+  if ! dotnet_licence; then
+    if [[ $ENGINE == crossover ]]; then
+      note "not installed. Either run this again and agree, or install it through CrossOver's window:"
+      note "  citavi-crossover setup --guided"
+    else note "not installed. Run this again and agree."; fi
+    exit 1
+  fi
+  local line name file sha url winver dlls args f id k dll
+  for line in $DOTNET_STEPS; do
+    IFS='|' read -r name file sha url winver dlls args <<< "$line"
+    f="$DOTNET_CACHE/$file"
+    if [[ -f "$f" && "$(shasum -a 256 "$f" | cut -d' ' -f1)" == "$sha" ]]; then ok "$file (downloaded earlier)"
+    else
+      note "downloading $file from Microsoft…"
+      fetch "$url" "$f" "$sha" || { bad "could not download $file"; dotnet_failed "the download failed (no internet connection?)"; return; }
+      ok "$file"
+    fi
+  done
+
+  mkdir -p "$STATE/logs"
+  note "removing Wine Mono, the stand-in for .NET that a new bottle comes with…"
+  for id in $(bwine uninstaller --list 2>&1 | tr -d '\r' | grep -i 'mono' | cut -d'|' -f1); do
+    bwine -w uninstaller --remove "$id" >/dev/null 2>&1
+  done
+  for k in 'HKLM\Software\Microsoft\NET Framework Setup\NDP\v3.5' 'HKLM\Software\Microsoft\NET Framework Setup\NDP\v4'; do
+    bwine reg delete "$k" /f /reg:64 >/dev/null 2>&1; bwine reg delete "$k" /f /reg:32 >/dev/null 2>&1
+  done
+  # Wine's own mscoree.dll (which starts Mono) has to go, or Microsoft's installer keeps it.
+  for dll in "$BOTTLE/drive_c/windows/system32/mscoree.dll" "$BOTTLE/drive_c/windows/syswow64/mscoree.dll"; do
+    [[ -f "$dll" ]] && LC_ALL=C grep -a -q 'Wine builtin DLL' "$dll" && rm -f "$dll"
+  done
+  bwine reg add 'HKCU\Software\Wine\DllOverrides' /v mscoree /t REG_SZ /d native /f >/dev/null 2>&1 \
+    || { dotnet_failed "could not write to the bottle's registry"; return; }
+
+  mkdir -p "$BOTTLE/drive_c/windows/assembly"
+  local rc opts exe watch=
+  for line in $DOTNET_STEPS; do
+    IFS='|' read -r name file sha url winver dlls args <<< "$line"
+    note "installing $name (a minute or two)…"
+    opts=(-a -v "$winver"); [[ -n "$dlls" ]] && opts+=(-d "$dlls")
+    exe=$(stage_file "$DOTNET_CACHE/$file")
+    if [[ $ENGINE == wine ]]; then
+      ngen32_watch & watch=$!
+      bwine $opts "$exe" "${(@s:;:)args}" > "$STATE/logs/dotnet-${file:r}.log" 2>&1; rc=$?
+      kill $watch 2>/dev/null; wait $watch 2>/dev/null
+      [[ -f "$NGEN32_MARK" ]] && ngen32_off
+      wine_idle
+    else
+      bwine -w $opts "$exe" "${(@s:;:)args}" > "$STATE/logs/dotnet-${file:r}.log" 2>&1; rc=$?
+    fi
+    unstage_files
+    # 3010 is Windows for "done, restart wanted"; a shell sees it as 194 (3010 mod 256).
+    (( rc == 0 || rc == 194 )) || { dotnet_failed "$name: Microsoft's installer ended with code $rc"; return; }
+    bottle_reboot
+    ok "$name"
+  done
+  local have; have=$(dotnet_release)
+  if [[ -f "$FRAMEWORK/clr.dll" ]] && (( have >= 528040 )); then ok "Microsoft .NET Framework 4.8 is installed (release $have)"
+  else dotnet_failed "the installers finished, but .NET 4.8 is not in the bottle (release $have)"; fi
+}
+
+# The unattended install did not work: say why, and offer CrossOver's own installer instead.
+dotnet_failed() {
+  bad "the unattended .NET install did not work: $1"
+  note "installer logs: $STATE/logs/dotnet-*.log and $WIN_HOME/AppData/Local/Temp"
+  if [[ $ENGINE == wine ]]; then
+    print -- "
+  To try again from an empty bottle: run  citavi-crossover uninstall  and answer yes for the
+  bottle only, then run  citavi-crossover setup  again."
+    exit 1
+  fi
+  print -- "
+  The other way is CrossOver's own installer for .NET 4.8: you click through it,
+  this tool waits and then carries on by itself."
+  if [[ -f "$STATE/created-by-setup" ]] && ! citavi_installed; then
+    if confirm "  Replace the half-finished bottle '$BOTTLE_NAME' with an empty one and do that now?"; then
+      bottle_delete || die "could not remove $BOTTLE — delete the bottle in CrossOver, then run: citavi-crossover setup"
+      bottle_create || die "could not create the bottle"
+      dotnet_guided; return
+    fi
+  fi
+  print -- "
+  To do it later: delete the bottle '$BOTTLE_NAME' in CrossOver (Bottle ▸ Delete Bottle…), then run
+    citavi-crossover setup --guided"
+  exit 1
+}
+
+# CrossOver's own installer, driven by the user; we wait until .NET 4.8 has arrived.
+dotnet_guided() {
+  step "Microsoft .NET Framework 4.8 through CrossOver's window"
+  if dotnet_ok; then ok "already in the bottle"; return 0; fi
+  if crossover_running; then
+    print -- "
+  CrossOver is open, and an open CrossOver does not show a bottle that was made meanwhile.
+  ${B}Quit CrossOver now${N} (menu CrossOver ▸ Quit CrossOver, or ⌘Q). This window notices and
+  opens it again. Quitting CrossOver closes every Windows program it is running, so save
+  your work in those first."
+    while crossover_running; do pause 2; done
+  fi
+  open -a "$CROSSOVER_APP"
+  print -- "
+  CrossOver is opening. Do this there (about 20 minutes, mostly waiting):
+
+    1. In the list on the left, click the bottle  ${B}$BOTTLE_NAME${N}.
+    2. On the right, under BOTTLE ACTIONS, click  ${B}Install Application into Bottle${N}
+       (the same thing is in the menu: Bottle ▸ Install Software into Bottle…).
+    3. Type  ${B}.NET Framework 4.8${N}  into the search box and choose
+       ${B}Microsoft .NET Framework 4.8${N}  from the results.
+    4. Click  ${B}Install${N}.  CrossOver downloads and starts Microsoft's installers one after
+       another (.NET 2.0, 4.0 and 4.8). In each one, accept the licence and click through
+       to the end. If one asks to restart, choose to restart later.
+    5. When CrossOver says the installation has finished, click  ${B}Done${N}.
+
+  Leave this window open: it notices when .NET 4.8 is there and carries on by itself.
+  (To stop waiting press Ctrl-C; running  citavi-crossover setup  later picks up from here.)
+"
+  local t0=$SECONDS quiet=0
+  while true; do
+    if dotnet_files_ok && ! installers_running; then quiet=$((quiet+1)); else quiet=0; fi
+    (( quiet >= 4 )) && break                       # there, and nothing installing, for 20 seconds
+    [[ -t 1 ]] && printf '\r        waiting for .NET Framework 4.8…  %d min ' $(( (SECONDS - t0) / 60 ))
+    pause 5
+  done
+  [[ -t 1 ]] && printf '\r%60s\r' ''
+  ok "Microsoft .NET Framework 4.8 is in the bottle"
+}
+
+cmd_registry() {
+  need_bottle
+  step "Registry fixes"
+  each_registry_fix apply_fix
+  step "Display (RETINA=$RETINA in config.sh)"
+  each_display_fix apply_fix
+  citavi_running && note "display changes take effect after you quit Citavi and start it again"
+  return 0
+}
+
+# Copies the fonts in fonts/ into the bottle. Wine loads every font file in C:\windows\Fonts.
+# The fonts in fonts/source/ are what the others are built from (fonts/build-fonts.py); earlier
+# versions of this tool copied those into the bottle, so copies of them are taken out again.
+cmd_fonts() {
+  need_bottle
+  step "Fonts"
+  local f dst="$BOTTLE/drive_c/windows/Fonts" n=0 old=0
+  mkdir -p "$dst"
+  for f in "$ROOT"/fonts/*.ttf(N); do
+    cmp -s "$f" "$dst/${f:t}" || { cp "$f" "$dst/" || die "could not copy ${f:t} into the bottle"; n=$((n+1)); }
+  done
+  for f in "$ROOT"/fonts/source/*.ttf(N); do
+    cmp -s "$f" "$dst/${f:t}" && { rm -f "$dst/${f:t}"; old=$((old+1)); }
+  done
+  ok "$(print -l "$ROOT"/fonts/*.ttf(N) | wc -l | tr -d ' ') font files in the bottle ($n copied now)"
+  (( old )) && note "removed $old font files of an earlier version of this tool (they are in fonts/source/)"
+  (( n )) && citavi_running && note "new fonts are used after you quit Citavi and start it again"
+  return 0
+}
+fonts_missing() {  # prints the names of fonts/ files the bottle lacks or has in another version
+  local f
+  for f in "$ROOT"/fonts/*.ttf(N); do cmp -s "$f" "$BOTTLE/drive_c/windows/Fonts/${f:t}" || print -- "${f:t}"; done
+}
+
+# ---- Citavi's installer
+#
+# citavi_msi_fetch missing : download the installer from Citavi's official link if we have none.
+# citavi_msi_fetch newer   : also download when the link offers a different file than ours.
+# The link's ETag (a fingerprint the server sends) is kept next to the file to tell the two apart.
+# Returns 0 when a file was downloaded now, 1 when the file already here was kept.
+citavi_msi_fetch() {
+  local mode=$1 head etag size mine
+  if [[ -f "$CITAVI_MSI" && "$mode" == missing ]]; then return 1; fi
+  head=$(curl -sIL --max-time 20 "$CITAVI_MSI_URL" 2>/dev/null | tr -d '\r')
+  etag=$(print -r -- "$head" | awk 'tolower($1)=="etag:" {print $2}' | tail -1)
+  size=$(print -r -- "$head" | awk 'tolower($1)=="content-length:" {print $2}' | tail -1)
+  if [[ -f "$CITAVI_MSI" ]]; then
+    if [[ -z "$etag" ]]; then warn "could not reach Citavi's download link; using the installer already here"; return 1; fi
+    mine=$(cat "$CITAVI_MSI.etag" 2>/dev/null)
+    # No fingerprint on record (the file was put here by hand): the same size counts as the same file.
+    [[ -z "$mine" && "$(stat -f %z "$CITAVI_MSI")" == "$size" ]] && { print -r -- "$etag" > "$CITAVI_MSI.etag"; mine=$etag; }
+    [[ "$mine" == "$etag" ]] && return 1
+  fi
+  [[ -n "$size" ]] || die "could not reach Citavi's download link ($CITAVI_MSI_URL).
+Check the internet connection, or download Citavi7Setup.msi yourself (the “MSI-Setup” link on
+https://www.citavi.com/download) and run:  citavi-crossover setup /path/to/Citavi7Setup.msi"
+  note "downloading ${CITAVI_MSI:t} from Citavi ($(( size / 1048576 )) MB)…"
+  fetch "$CITAVI_MSI_URL" "$CITAVI_MSI" || die "the download failed. Run the command again to continue it."
+  [[ "$(head -c 8 "$CITAVI_MSI" | xxd -p)" == d0cf11e0a1b11ae1 ]] \
+    || { mv -f "$CITAVI_MSI" "$CITAVI_MSI.bad"; die "what came from $CITAVI_MSI_URL is not a Windows installer (kept as ${CITAVI_MSI:t}.bad)"; }
+  print -r -- "$etag" > "$CITAVI_MSI.etag"
+  ok "${CITAVI_MSI:t} downloaded"
+  return 0
+}
+
+CITAVI_LICENCE_OK=0
+citavi_licence() {
+  (( CITAVI_LICENCE_OK )) && return 0
+  print -- "
+  Citavi's installer runs without showing its licence screen. Going on means you accept
+  Citavi's licence terms (https://www.citavi.com/eula)."
+  confirm "  Install Citavi and accept its licence terms?" || return 1
+  CITAVI_LICENCE_OK=1
+}
+
+# Citavi's installer does part of its work in steps of its own ("custom actions") that are
+# 32-bit .NET code. Where 32-bit .NET does not run (dotnet32_works), the installer would hang at
+# the first of them that does real work, with all files already copied.
+#
+# msi_drop_dotnet_steps <installer copy in the bottle>: takes those steps out of the copy. They are
+# the actions that live in the same library as SetCustomActionData. Wine's own msidb writes the
+# installer's table of steps to a text file and reads it back.
+# citavi_finish_install: does what the dropped steps do that Citavi needs: copy the 64-bit
+# libraries into bin, and write Citavi's path into the registry. (They also register the Word
+# add-in and the browser pickers, which have no use in a bottle, and file types.)
+msi_drop_dotnet_steps() {
+  local dir="$STATE/installers/tables" win="$STATE_WIN\\installers\\${1:t}" lib n
+  rm -rf "$dir"; mkdir -p "$dir"
+  bwine msidb -d "$win" -f "$STATE_WIN\\installers\\tables" -e InstallExecuteSequence CustomAction >/dev/null 2>&1
+  [[ -s "$dir/InstallExecuteSequence.idt" && -s "$dir/CustomAction.idt" ]] || return 1
+  lib=$(awk -F'\t' '$1 == "SetCustomActionData" {print $3}' "$dir/CustomAction.idt")
+  [[ -n "$lib" ]] || return 1
+  awk -F'\t' -v lib="$lib" 'NR > 3 && $3 == lib {print $1}' "$dir/CustomAction.idt" > "$dir/dropped.txt"
+  awk -F'\t' 'NR == FNR {drop[$1] = 1; next} FNR <= 3 || !($1 in drop)' "$dir/dropped.txt" "$dir/InstallExecuteSequence.idt" > "$dir/new.idt"
+  n=$(( $(wc -l < "$dir/InstallExecuteSequence.idt") - $(wc -l < "$dir/new.idt") ))
+  (( n > 0 )) || return 1
+  mv -f "$dir/new.idt" "$dir/InstallExecuteSequence.idt"; rm -f "$dir/CustomAction.idt"
+  bwine msidb -d "$win" -f "$STATE_WIN\\installers\\tables" -i InstallExecuteSequence.idt >/dev/null 2>&1 || return 1
+  cp "$dir/dropped.txt" "$STATE/logs/installer-steps-left-out.txt"
+  note "$n of the installer's own steps left out (listed in $STATE/logs/installer-steps-left-out.txt)"
+}
+citavi_finish_install() {
+  local f n=0
+  for f in "$BIN"/x64/*.dll(N) "$BIN"/PDFNet/x64/*.dll(N); do cp -f "$f" "$BIN/" && n=$((n+1)); done
+  (( n )) || return 1
+  bwine reg add 'HKLM\Software\Swiss Academic Software\Citavi 7' /v Path /t REG_SZ /d "$CITAVI_WIN_DIR\\Bin\\Citavi.exe" /f /reg:32 >/dev/null 2>&1
+  note "$n 64-bit libraries copied into Citavi's bin folder"
+}
+
+# Citavi's installer puts a Windows shortcut, "Citavi 7.lnk", on the Windows desktop. In a Wine
+# bottle that folder is a link to the Mac's own Desktop, where the file does nothing: macOS cannot
+# open it. So it is taken away again. (CrossOver gives a bottle a desktop folder of its own.)
+desktop_shortcut_remove() {
+  local lnk="$WIN_HOME/Desktop/Citavi 7.lnk"
+  [[ -L "$WIN_HOME/Desktop" && -f "$lnk" ]] || return 0
+  rm -f "${lnk:?}" && note "removed the Windows shortcut “Citavi 7.lnk” that Citavi's installer put on your Desktop"
+}
+
+cmd_install() {
+  local msi=${1:-}
+  need_bottle
+  dotnet_ok || die "the bottle has no Microsoft .NET Framework 4.8 yet — run: citavi-crossover setup"
+  need_closed
+  step "Citavi (about 3 minutes; a small progress window appears)"
+  citavi_licence || { note "Citavi was not installed."; exit 1; }
+  if [[ -z "$msi" ]]; then citavi_msi_fetch missing; msi=$CITAVI_MSI; fi
+  [[ -f "$msi" ]] || die "installer not found: $msi"
+  [[ "${msi:l}" == *.msi ]] || die "give the .msi installer, not the .exe: only the .msi can be installed without clicking
+(it is the “MSI-Setup” link on https://www.citavi.com/download)"
+  msi=${msi:A}
+  mkdir -p "$STATE/logs"
+  local stamp=$(date +%Y%m%d-%H%M%S) log
+  log="$STATE/logs/install-$stamp.log"
+  local staged by_hand=0; staged=$(stage_file "$msi")
+  if ! dotnet32_works; then
+    note "this Wine cannot run 32-bit .NET programs, which the installer uses for some of its steps;"
+    note "those steps are left out and their work is done here instead"
+    msi_drop_dotnet_steps "$msi" || { unstage_files; die "could not take the 32-bit .NET steps out of the installer (has its layout changed? see docs/ADAPTING.md)"; }
+    by_hand=1
+  fi
+  note "installing ${msi:t}…"
+  bwine -a msiexec.exe /i "$staged" /qb '/l*v' "$STATE_WIN\\logs\\install-$stamp.log" >/dev/null 2>&1
+  unstage_files
+  CITAVI_VERSION=
+  if (( by_hand )) && citavi_installed; then citavi_finish_install || { bad "Citavi's 64-bit libraries were not found in its bin\\x64 folder"; exit 1; }; fi
+  if grep -q "INSTALL. Return value 1" "$log" 2>/dev/null && citavi_installed; then
+    ok "Citavi $(citavi_version) installed"
+    desktop_shortcut_remove
+  else
+    bad "the installer did not finish successfully"
+    note "log: $log"
+    grep -n -E "Return value 3|Error [0-9]+" "$log" 2>/dev/null | head -5
+    exit 1
+  fi
+}
+
+cmd_patch() {
+  need_citavi; need_closed
+  local version; version=$(citavi_version)
+  step "Patching Citavi $version"
+  patcher apply "$BIN_WIN" --rules "$RULES_WIN" --backup "$STATE_WIN\\backup\\$version" \
+    --framework "$FRAMEWORK_WIN" --framework "$FRAMEWORK_WIN\\WPF"
+  local rc=$?
+  (( rc == 3 )) && warn "some rules no longer match this Citavi version — see docs/ADAPTING.md"
+  (( rc != 0 && rc != 3 )) && die "patching failed"
+  return 0
+}
+
+cmd_unpatch() {
+  need_citavi; need_closed
+  local version; version=$(citavi_version)
+  step "Restoring original files for Citavi $version"
+  patcher restore "$BIN_WIN" --backup "$STATE_WIN\\backup\\$version"
+  rm -f "$BIN/CitaviTrace.dll"
+}
+
+# Which bottle the installed login helper sends sign-in links to: prints "<folder>" and returns
+# 0 when that is another bottle than this run's, 1 when it is this one or no helper is installed.
+helper_elsewhere() { app_elsewhere "$HELPER_APP"; }
+# The same question for either of our two apps (the login helper, and the app "Citavi 7").
+app_elsewhere() {
+  local pl="$1/Contents/Info.plist" hb hd
+  [[ -f "$pl" ]] || return 1
+  hb=$(plutil -extract CitaviBottle raw "$pl" 2>/dev/null); hd=$(plutil -extract CitaviBottleDir raw "$pl" 2>/dev/null)
+  [[ "$hd/$hb" == "$BOTTLE" ]] && return 1
+  print -r -- "$hd/$hb"
+}
+app_id() { plutil -extract CFBundleIdentifier raw "$1/Contents/Info.plist" 2>/dev/null; }
+
+# make_app <app> <identifier> <name>: one of our two small apps, assembled from the ready-built
+# program (see plain_copy). Which bottle it serves, and with which engine, goes into its
+# Info.plist. The caller adds what is its own and signs it, for this Mac only.
+make_app() {
+  local app=$1 plist="$1/Contents/Info.plist"
+  mkdir -p "$app/Contents/MacOS"
+  plain_copy "$HELPER_BIN" "$app/Contents/MacOS/CitaviLoginHelper" || die "could not copy the login helper's program"
+  chmod 755 "$app/Contents/MacOS/CitaviLoginHelper"
+  cat > "$plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>CitaviLoginHelper</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
+  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+</dict></plist>
+PLIST
+  plutil -insert CFBundleIdentifier  -string "$2"              "$plist"
+  plutil -insert CFBundleName        -string "$3"              "$plist"
+  plutil -insert CitaviBottle        -string "$BOTTLE_NAME"    "$plist"
+  plutil -insert CitaviBottleDir     -string "$BOTTLE_DIR"     "$plist"
+  plutil -insert CitaviEngine        -string "$ENGINE"         "$plist"
+  plutil -insert CitaviCrossOverRoot -string "$CX"             "$plist"
+  plutil -insert CitaviWineBin       -string "$WINE_BIN"       "$plist"
+  plutil -insert CitaviBinDir        -string "$BIN"            "$plist"
+  plutil -insert CitaviExe           -string "$CITAVI_EXE_WIN" "$plist"
+}
+cmd_helper() {
+  need_engine; need_prebuilt
+  step "Login helper (handles the citavi:// sign-in callback)"
+  if [[ -e "$HELPER_APP" && "$(app_id "$HELPER_APP")" != $HELPER_ID ]]; then
+    die "$HELPER_APP exists and is not this tool's app — move it away, or choose another folder (CITAVI_HELPER_DIR)"
+  fi
+  local tmp app; tmp=$(mktemp -d); app="$tmp/$HELPER_NAME"
+  make_app "$app" $HELPER_ID "Citavi Login Helper"
+  plutil -insert CFBundleURLTypes -json '[{"CFBundleURLName":"Citavi sign-in callback","CFBundleURLSchemes":["citavi"]}]' "$app/Contents/Info.plist"
+  codesign --force --sign - "$app" 2>/dev/null || die "could not sign the login helper"
+  mkdir -p "$HELPER_INSTALL_DIR"
+  rm -rf "${HELPER_APP:?}"; cp -R "$app" "$HELPER_APP"; rm -rf "$tmp"
+  "$LSREGISTER" -f "$HELPER_APP"
+  local handler; handler=$("$HELPER_APP/Contents/MacOS/CitaviLoginHelper" --register 2>&1)
+  if [[ "$handler" == "$HELPER_APP" ]]; then ok "installed at $HELPER_APP and registered for citavi://"
+  else bad "installed, but citavi:// is still handled by: $handler"; fi
+  [[ $ENGINE == wine ]] && launcher_install
+  return 0
+}
+
+# Wine has no window that lists Citavi and makes no Mac app for it (CrossOver does both). So the
+# tool makes one, "Citavi 7": the login helper's program again, without the claim on citavi://
+# and told by its Info.plist to start Citavi at once. Spotlight, Launchpad and the Dock find it.
+launcher_install() {
+  step "The app “Citavi 7” (starts Citavi)"
+  citavi_installed || { note "comes with Citavi: run this again once Citavi is installed"; return 0; }
+  if [[ -e "$LAUNCHER_APP" && "$(app_id "$LAUNCHER_APP")" != $LAUNCHER_ID ]]; then
+    warn "$LAUNCHER_APP is another app and stays as it is; no app for Citavi was installed"
+    note "start Citavi with: citavi-crossover run"; return 0
+  fi
+  local tmp app icon=0; tmp=$(mktemp -d); app="$tmp/$LAUNCHER_NAME"
+  make_app "$app" $LAUNCHER_ID "Citavi 7"
+  plutil -insert CitaviRole -string launcher "$app/Contents/Info.plist"
+  mkdir -p "$app/Contents/Resources"
+  if launcher_icon "$app/Contents/Resources/Citavi.icns"; then
+    plutil -insert CFBundleIconFile -string Citavi "$app/Contents/Info.plist"; icon=1
+  fi
+  codesign --force --sign - "$app" 2>/dev/null || { rm -rf "$tmp"; bad "could not sign the app"; return 0; }
+  mkdir -p "$HELPER_INSTALL_DIR"
+  rm -rf "${LAUNCHER_APP:?}"; cp -R "$app" "$LAUNCHER_APP"; rm -rf "$tmp"
+  "$LSREGISTER" -f "$LAUNCHER_APP"
+  ok "installed at $LAUNCHER_APP"
+  (( icon )) || note "it has a plain icon: Citavi's own could not be read from Citavi.exe"
+  return 0
+}
+# launcher_icon <file.icns>: Citavi's icon as a Mac icon file; false when that does not work.
+# It is read from the installed Citavi.exe, on this Mac, so Citavi's artwork is not part of this
+# folder. wclick writes the largest picture of the icon as a PNG (256 pixels wide, as a rule);
+# sips and iconutil, which come with macOS, make the sizes a Mac icon consists of.
+launcher_icon() {
+  local png="$TOOLS/citavi-icon.png" iconset="${1:r}.iconset" s
+  rm -f "$png"
+  wclick icon "$CITAVI_EXE_WIN" "$TOOLS_WIN\\citavi-icon.png" >/dev/null 2>&1
+  [[ -s "$png" ]] || return 1
+  mkdir -p "$iconset"
+  for s in 16 32 128 256; do
+    sips -z $s $s "$png" --out "$iconset/icon_${s}x${s}.png" >/dev/null 2>&1
+    sips -z $((s*2)) $((s*2)) "$png" --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null 2>&1
+  done
+  iconutil -c icns -o "$1" "$iconset" >/dev/null 2>&1
+  rm -rf "$iconset" "$png"
+  [[ -s "$1" ]]
+}
+
+cmd_run() {
+  need_citavi
+  local runlog= ts; ts=$(date +%Y%m%d-%H%M%S)
+  while [[ "${1:-}" == --log || "${1:-}" == --trace ]]; do
+    if [[ "$1" == --log ]]; then
+      mkdir -p "$WORK/logs"
+      runlog="$WORK/logs/run-$ts.cxlog"
+      print -- "$ENGINE_NAME log: $runlog"
+    else
+      citavi_running && die "Citavi is already running; quit it first so that it can be started with tracing."
+      trace_on "trace-$ts.log"
+      print -- "Exception trace: $STATE/logs/trace-$ts.log
+Reproduce the problem, then run:  citavi-crossover trace"
+    fi
+    shift
+  done
+  start_citavi "$runlog" "$@"
+}
+
+cmd_doctor() {
+  local problems=0
+  step "Tools"
+  if [[ $ENGINE == crossover ]]; then
+    [[ -x "$CX/bin/wine" ]] && ok "CrossOver $(defaults read "$CROSSOVER_APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)" \
+      || { bad "CrossOver not found at $CROSSOVER_APP"; exit 1; }
+  else
+    local wv; wv=$("$WINE" --version 2>/dev/null)
+    [[ -n "$wv" ]] && ok "Wine ${wv#wine-} at ${WINE_BIN%/Contents/Resources/*}" \
+      || { bad "Wine is missing or macOS does not let it start"; note "see: citavi-crossover preflight"; exit 1; }
+  fi
+  if [[ -f "$PATCHER_EXE" ]] && ( cd "$ROOT" && shasum -a 256 -c --status prebuilt/SOURCES.sha256 2>/dev/null ); then ok "ready-built helpers"
+  else bad "the helpers in prebuilt/ are missing or older than their source"; note "fix with: citavi-crossover build"; exit 1; fi
+
+  step "Bottle"
+  if [[ -d "$BOTTLE/drive_c" ]]; then need_own_bottle; ok "'$BOTTLE_NAME' at $BOTTLE"; else bad "bottle '$BOTTLE_NAME' not found — run: citavi-crossover setup"; exit 1; fi
+  if dotnet_ok; then ok "Microsoft .NET Framework 4.8"
+  else bad "Microsoft .NET Framework 4.8 is missing in the bottle"; note "fix with: citavi-crossover setup"; exit 1; fi
+  FIX_PROBLEMS=0; each_registry_fix check_fix; each_display_fix check_fix; problems=$((problems+FIX_PROBLEMS))
+  (( FIX_PROBLEMS )) && note "fix with: citavi-crossover registry"
+  local missing; missing=$(fonts_missing)
+  if [[ -z "$missing" ]]; then ok "fonts: Bottle UI, built from Selawik, Open Sans and Noto Sans (stands in for Segoe UI)"
+  else bad "fonts missing in the bottle: ${missing//$'\n'/, }"; note "fix with: citavi-crossover fonts"; problems=$((problems+1)); fi
+
+  step "Citavi"
+  if citavi_installed; then
+    ok "Citavi $(citavi_version) installed"
+    if [[ -n "$(citavi_version)" && "$(citavi_version)" != "$TESTED_CITAVI" ]]; then
+      warn "the fixes were last checked with Citavi $TESTED_CITAVI, and this is another version"
+      note "if Citavi misbehaves: citavi-crossover diagnose, then docs/ADAPTING.md"
+    fi
+    [[ -f "$BIN/SQLite.Interop.dll" ]] || { bad "Citavi's 64-bit libraries are missing from its bin folder (the installer did not finish)"; note "fix with: citavi-crossover install"; problems=$((problems+1)); }
+    local out; out=$(patcher verify "$BIN_WIN" --rules "$RULES_WIN"); local rc=$?
+    case $rc in
+      0) ok "all IL patches applied" ;;
+      1) bad "IL patches missing (Citavi was updated or reinstalled)"; print -- "$out" | sed 's/^/        /'; note "fix with: citavi-crossover patch"; problems=$((problems+1)) ;;
+      3) warn "a patch rule no longer matches this version"; print -- "$out" | sed 's/^/        /'; note "see docs/ADAPTING.md" ;;
+      *) bad "patch check failed"; print -- "$out" | sed 's/^/        /'; problems=$((problems+1)) ;;
+    esac
+  else
+    bad "Citavi is not installed — run: citavi-crossover setup"; problems=$((problems+1))
+  fi
+
+  step "Login"
+  if [[ -x "$HELPER_APP/Contents/MacOS/CitaviLoginHelper" ]]; then
+    local handler; handler=$("$HELPER_APP/Contents/MacOS/CitaviLoginHelper" --status 2>/dev/null)
+    if [[ "$handler" == "$HELPER_APP" ]]; then ok "citavi:// links go to the login helper"
+    else bad "citavi:// links go to: ${handler:-nothing}"; note "fix with: citavi-crossover helper"; problems=$((problems+1)); fi
+    local other; other=$(helper_elsewhere)
+    if [[ -n "$other" && -d "$other/drive_c" ]]; then
+      warn "sign-in links go to another bottle: $other"
+      note "only one bottle at a time can receive them; to sign in from this one, run: citavi-crossover helper"
+    elif [[ -n "$other" ]]; then
+      bad "the login helper points at a bottle that no longer exists: $other"; note "fix with: citavi-crossover helper"; problems=$((problems+1))
+    fi
+  else
+    bad "login helper not installed — sign-in cannot complete"; note "fix with: citavi-crossover helper"; problems=$((problems+1))
+  fi
+  if [[ $ENGINE == wine ]]; then
+    if [[ "$(app_id "$LAUNCHER_APP")" == $LAUNCHER_ID && -z "$(app_elsewhere "$LAUNCHER_APP")" ]]; then ok "the app “Citavi 7” in $HELPER_INSTALL_DIR starts Citavi"
+    else warn "no app “Citavi 7” for this bottle in $HELPER_INSTALL_DIR (Citavi still starts with: citavi-crossover run)"; note "fix with: citavi-crossover helper"; fi
+  fi
+
+  print
+  if (( problems )); then print -- "${R}${problems} problem(s) found.${N}"; return 1; fi
+  print -- "${G}Everything checks out.${N} Start Citavi with: citavi-crossover run"
+}
+
+# setup [installer.msi]: everything, from a Mac with CrossOver to a Citavi that starts.
+# Each part skips what is already done, so running it again continues where it stopped.
+cmd_setup() {
+  local msi=${1:-} n=0
+  part() { n=$((n+1)); print -- "\n${B}[$n/8] $1${N}"; }
+  print -- "${B}Setting up Citavi 7 in the $ENGINE_NAME bottle '$BOTTLE_NAME'${N}"
+
+  part "Checking this Mac";                 cmd_preflight
+
+  # Ask for everything that needs a yes now, so that the rest runs without you.
+  local want_dotnet=0 want_citavi=0 template="$BOTTLE_DIR/$TEMPLATE_BOTTLE"
+  [[ -d "$BOTTLE/drive_c" ]] && dotnet_ok || [[ -n "$TEMPLATE_BOTTLE" && -f "$template/drive_c/windows/Microsoft.NET/Framework64/v4.0.30319/clr.dll" && ! -d "$BOTTLE/drive_c" ]] || want_dotnet=1
+  citavi_installed && [[ -z "$msi" ]] || want_citavi=1
+  if (( want_dotnet || want_citavi )); then
+    print -- "\n${B}Before it starts${N}
+  The rest takes about 15 minutes and needs nothing from you except the answers below."
+    if (( want_dotnet && ! GUIDED )); then
+      dotnet_licence || { print -- "\n  Nothing was changed. To install .NET through CrossOver's own window instead
+  (you read and accept Microsoft's licence there, and click through its installers), run:
+    citavi-crossover setup --guided"; exit 1; }
+    fi
+    if (( want_citavi )); then citavi_licence || { print -- "\n  Nothing was changed."; exit 1; }; fi
+  fi
+
+  part "Bottle and Microsoft .NET Framework 4.8"; cmd_bottle
+  part "Registry fixes";                     cmd_registry
+  part "Fonts";                              cmd_fonts
+  part "Citavi"
+  if citavi_installed && [[ -z "$msi" ]]; then step "Citavi"; ok "already installed ($(citavi_version)) — skipping the installer"
+  else cmd_install "$msi"; fi
+  part "Patches";                            cmd_patch
+  part "Login helper"
+  local other; other=$(helper_elsewhere)
+  if [[ -n "$other" && -d "$other/drive_c" ]] && ! (( ASSUME_YES )) && ! { [[ -t 0 ]] && confirm "  Sign-in links now go to the bottle at $other. Send them to this bottle instead?"; }; then
+    step "Login helper"; warn "left as it is: sign-in links still go to $other"
+    note "to sign in from this bottle, run: citavi-crossover helper"
+    [[ $ENGINE == wine ]] && launcher_install
+  else cmd_helper; fi
+  part "Final check";                        cmd_doctor || exit 1
+  print -- "
+${B}Citavi is ready.${N}
+  Start it:   ${B}./citavi-crossover run${N}
+  Sign in:    click “Log in” in Citavi. Your browser opens Citavi's sign-in page. After you sign in,
+              the browser asks whether to open “Citavi Login Helper”: allow it, and Citavi continues.
+  The first time, Citavi shows a short welcome assistant: click “Let's go”, then “Close”."
+  if [[ -n "$(helper_elsewhere)" ]]; then print -- "
+  Before signing in from this bottle, send the sign-in links to it:  ./citavi-crossover helper"
+  fi
+  if [[ $ENGINE == wine && "$(app_id "$LAUNCHER_APP")" == $LAUNCHER_ID ]]; then print -- "
+  Without Terminal: open the app “Citavi 7” in $HELPER_INSTALL_DIR (Spotlight finds it)."
+  elif [[ $ENGINE == crossover ]]; then print -- "
+  Without Terminal: Citavi has an icon in CrossOver's window, under the bottle '$BOTTLE_NAME'."
+    crossover_running && print -- "  CrossOver is open now. It shows the new bottle after you quit and reopen it
+  (quitting CrossOver closes the Windows programs it is running)."
+  fi
+  print -- "
+  To remove everything again:  ./citavi-crossover uninstall"
+  if [[ -t 0 && -t 1 ]] && (( ! ASSUME_YES )) && ! citavi_running; then
+    local a; print; read "a?Start Citavi now? [Y/n] "
+    [[ "$a" == [nN]* ]] || cmd_run
+  fi
+  return 0
+}
+
+# ---- uninstall
+#
+# Removes what this tool put on the Mac, part by part. Nothing goes before a yes to its own
+# question, and the questions' default is no. Deleting a bottle cannot be undone, so that part
+# has more in front of it:
+#   - it does not happen while Citavi is running in the bottle;
+#   - it does not happen when Citavi project files lie inside the bottle (bottle_projects);
+#   - a bottle that setup did not make, or that holds other programs or files of the user's, goes
+#     only when the user types its name; --yes does not answer that.
+# Never touched: ~/Documents (the projects), CrossOver or Wine, other bottles, this folder.
+du_h() { du -sh "$1" 2>/dev/null | cut -f1 | tr -d ' '; }
+# Citavi project files (.ctv6, .ctv6bak, .ctv6archive …) that lie in the bottle itself. find does
+# not follow links, so what is behind the bottle's link to ~/Documents is not seen here; it is
+# not deleted with the bottle either.
+bottle_projects() {
+  find "$BOTTLE/drive_c" \( -path "$BOTTLE/drive_c/Program Files*" -o -path "$BOTTLE/drive_c/windows" -o -path "$STATE" \) -prune \
+    -o -type f -iname '*.ctv*' -print 2>/dev/null
+}
+# Other files of the user's in the bottle: whatever lies in the Windows users' folders (Desktop
+# and so on), leaving out program settings (AppData), shortcuts and Windows' own marker files.
+bottle_user_files() {
+  find "$BOTTLE/drive_c/users" -name AppData -prune \
+    -o -type f ! -iname '*.lnk' ! -iname 'desktop.ini' ! -iname 'ntuser.*' ! -name '.DS_Store' ! -iname '*.ctv*' -print 2>/dev/null
+}
+# Programs in the bottle other than Citavi and what Windows and .NET bring along.
+bottle_other_programs() {
+  local d
+  for d in "$BOTTLE/drive_c/Program Files"/*(N/) "$BOTTLE/drive_c/Program Files (x86)"/*(N/); do
+    case ${d:t} in
+      "Citavi 7"|"Common Files"|"Internet Explorer"|"Windows Media Player"|"Windows NT"|"Windows Mail"|"Windows Photo Viewer"|Microsoft.NET|"Reference Assemblies"|MSBuild) ;;
+      *) print -r -- "${d:t}" ;;
+    esac
+  done
+}
+# A Citavi bottle of the engine this run does not use, if there is one under the same name.
+other_engine_bottle() {
+  local d
+  if [[ $ENGINE == crossover ]]; then d="$HOME/Library/Application Support/citavi-crossover/Bottles"
+  else d=$(defaults read com.codeweavers.CrossOver BottleDir 2>/dev/null); d="${d:-$HOME/Library/Application Support/CrossOver/Bottles}"; fi
+  [[ -f "$d/$BOTTLE_NAME/$CITAVI_UNIX_SUBDIR/bin/Citavi.exe" ]] && print -r -- "$d/$BOTTLE_NAME"
+}
+# uninstall_app <app> <identifier> <what it is> <question>: one of our two apps, after a yes.
+# Returns 0 when it was removed.
+uninstall_app() {
+  local app=$1 other
+  if [[ ! -e "$app" ]]; then note "not installed"; return 1; fi
+  if [[ "$(app_id "$app")" != "$2" ]]; then warn "$app is not this tool's app; left alone"; return 1; fi
+  other=$(app_elsewhere "$app")
+  if [[ -n "$other" && -d "$other/drive_c" ]]; then
+    note "$app serves another bottle, $other, and stays."
+    note "It goes with that bottle: run uninstall with that bottle's engine and name."
+    return 1
+  fi
+  print -- "  $app"
+  confirm "  $4" || { note "kept"; return 1; }
+  "$LSREGISTER" -u "$app" >/dev/null 2>&1
+  rm -rf "${app:?}"
+  [[ ! -e "$app" ]] && ok "removed $3" || { bad "could not remove $app"; return 1; }
+}
+cmd_uninstall() {
+  local removed=() a
+  print -- "${B}Removing Citavi 7 ($ENGINE_NAME, bottle '$BOTTLE_NAME')${N}
+  Nothing is removed before you answer yes to it; every question's answer is no unless you
+  type y. Never touched: your Citavi projects in ~/Documents, $ENGINE_NAME itself, other
+  bottles, and this folder."
+
+  # What is there, before the first question.
+  local f files2=() line file bsize=
+  for f in "$CITAVI_MSI" "$CITAVI_MSI.etag" "$CITAVI_MSI.part" "$CITAVI_MSI.bad"; do
+    [[ "$f" == "$ROOT/resources/"* && -f "$f" ]] && files2+=("$f")
+  done
+  for line in $DOTNET_STEPS; do
+    file=${${line#*|}%%|*}
+    for f in "$DOTNET_CACHE/$file" "$DOTNET_CACHE/$file.part"; do [[ -f "$f" ]] && files2+=("$f"); done
+  done
+  step "Found on this Mac"
+  if [[ -d "$BOTTLE/drive_c" ]]; then bsize=$(du_h "$BOTTLE"); print -- "  the bottle          $BOTTLE  ($bsize)"
+  else print -- "  the bottle          none named '$BOTTLE_NAME' in $BOTTLE_DIR"; fi
+  [[ -e "$HELPER_APP" ]]   && print -- "  the login helper    $HELPER_APP" || print -- "  the login helper    not installed"
+  [[ -e "$LAUNCHER_APP" ]] && print -- "  the app “Citavi 7”  $LAUNCHER_APP"
+  (( $#files2 )) && print -- "  downloads           $#files2 installer files in ${${files2[1]:h}#$ROOT/} and below"
+  [[ -d "$WORK" ]] && print -- "  generated files     work/  ($(du_h "$WORK"))"
+
+  step "The bottle"
+  if [[ ! -d "$BOTTLE/drive_c" ]]; then note "there is no bottle '$BOTTLE_NAME' in $BOTTLE_DIR"
+  else
+    need_own_bottle; need_closed
+    local projects others files marked=0 go=0
+    [[ -f "$STATE/created-by-setup" ]] && marked=1
+    print -- "  $BOTTLE  ($bsize)"
+    projects=$(bottle_projects); others=$(bottle_other_programs); files=$(bottle_user_files)
+    if [[ -n "$projects" ]]; then
+      bad "Citavi project files lie inside this bottle, so it is not deleted:"
+      print -r -- "$projects" | head -20 | sed 's/^/        /'
+      note "move them out, for example to ~/Documents/Citavi 7/Projects, then run uninstall again"
+    else
+      print -- "  Deleting it removes Citavi, the .NET Framework and Citavi's settings and sign-in, and the
+  bottle's copies of your cloud projects. Changes you made to a cloud project while offline
+  that Citavi has not sent to the cloud yet would be lost. ${B}This cannot be undone.${N}"
+      if (( marked )) && [[ -z "$others$files" ]]; then
+        confirm "  Delete the bottle '$BOTTLE_NAME'?" && go=1
+      else
+        (( marked )) || print -- "  This bottle was not made by this tool's setup."
+        [[ -n "$others" ]] && print -- "  Other programs in it: ${others//$'\n'/, }"
+        if [[ -n "$files" ]]; then
+          print -- "  Files in its Windows user folders (they would be deleted too):"
+          print -r -- "$files" | head -10 | sed 's/^/        /'
+          (( $(print -r -- "$files" | wc -l) > 10 )) && note "… and more"
+        fi
+        if [[ -t 0 ]]; then
+          read "a?  To delete the bottle, type its name ($BOTTLE_NAME). Anything else keeps it: "
+          [[ "$a" == "$BOTTLE_NAME" ]] && go=1
+        else note "a bottle like this is only deleted when you type its name in a terminal window; --yes does not cover it"; fi
+      fi
+      if (( go )); then
+        desktop_shortcut_remove      # from a setup before this tool removed it by itself
+        if bottle_delete; then
+          ok "bottle '$BOTTLE_NAME' deleted"; removed+=("the bottle '$BOTTLE_NAME'")
+          # Wine's bottles live in a folder this tool made; it goes when it is empty.
+          if [[ $ENGINE == wine && "$BOTTLE_DIR" == "$HOME/Library/Application Support/citavi-crossover/Bottles" ]]; then
+            rm -f "$BOTTLE_DIR/.DS_Store"; rmdir "$BOTTLE_DIR" 2>/dev/null && rmdir "${BOTTLE_DIR:h}" 2>/dev/null
+          fi
+        else
+          bad "could not delete the bottle"
+          if [[ $ENGINE == crossover ]]; then note "delete it in CrossOver's window: select the bottle, then Bottle ▸ Delete Bottle…"
+          else note "its folder is $BOTTLE"; fi
+        fi
+      else
+        note "kept. To keep the bottle but give Citavi its original program files back: citavi-crossover unpatch"
+      fi
+    fi
+  fi
+
+  step "Login helper"
+  if uninstall_app "$HELPER_APP" $HELPER_ID "the login helper" "Remove the login helper? Signing in to Citavi in a bottle does not work without it."; then
+    removed+=("the login helper")
+    rm -f "$HELPER_LOG"
+    # Who gets citavi:// links now? Asked with a copy of the helper's program (see plain_copy).
+    local t now; t=$(mktemp -d)
+    plain_copy "$HELPER_BIN" "$t/helper" 2>/dev/null && chmod 755 "$t/helper" && now=$("$t/helper" --status 2>/dev/null)
+    rm -rf "$t"
+    if [[ -z "${now:-}" || "$now" == "(none)" ]]; then note "no app claims citavi:// links any more"
+    else note "citavi:// links now go to: $now"; fi
+  fi
+  if [[ -e "$LAUNCHER_APP" ]]; then
+    step "The app “Citavi 7”"
+    uninstall_app "$LAUNCHER_APP" $LAUNCHER_ID "the app “Citavi 7”" "Remove the app “Citavi 7”?" && removed+=("the app “Citavi 7”")
+  fi
+
+  step "Downloads and generated files in this folder"
+  if (( ! $#files2 )) && [[ ! -d "$WORK" ]]; then note "none"
+  else
+    for f in $files2; do print -- "  ${f#$ROOT/}  ($(du_h "$f"))"; done
+    [[ -d "$WORK" ]] && print -- "  work/  ($(du_h "$WORK"))  logs and other files the tool generated"
+    if confirm "  Delete these? The installers are downloaded again when they are needed."; then
+      for f in $files2; do rm -f "${f:?}"; done
+      [[ -d "$WORK" && "$WORK" == "$ROOT/work" ]] && rm -rf "${WORK:?}"
+      rmdir "$DOTNET_CACHE" 2>/dev/null; rmdir "$ROOT/resources" 2>/dev/null
+      ok "deleted"; removed+=("the downloads and generated files")
+    else note "kept"; fi
+  fi
+
+  print
+  if (( $#removed )); then print -- "${B}Removed:${N} ${(j:, :)removed}."
+  else print -- "${B}Nothing was removed.${N}"; fi
+  print -- "Still on this Mac, and yours to keep or remove:
+  - Your Citavi projects in ~/Documents/Citavi 7 (and Citavi 6, if you have it). Not touched."
+  [[ -d "$BOTTLE/drive_c" ]] && print -- "  - The bottle '$BOTTLE_NAME' at $BOTTLE."
+  [[ -e "$HELPER_APP" ]] && print -- "  - $HELPER_APP"
+  [[ -e "$LAUNCHER_APP" ]] && print -- "  - $LAUNCHER_APP"
+  local ob; ob=$(other_engine_bottle)
+  if [[ -n "$ob" ]]; then
+    local oe=wine; [[ $ENGINE == wine ]] && oe=crossover
+    print -- "  - Another Citavi bottle, at $ob. To remove it:  CITAVI_ENGINE=$oe ./citavi-crossover uninstall"
+  fi
+  print -- "  - This folder, $ROOT. Move it to the Trash when you no longer want the tool."
+  if [[ $ENGINE == crossover ]]; then print -- "  - CrossOver and its other bottles. To remove CrossOver, move it from Applications to the Trash."
+  else print -- "  - Wine. To remove it:  brew uninstall --cask wine-stable   or move “Wine Stable” from Applications to the Trash."; fi
+  return 0
+}
+
+# update [installer.msi]: a newer Citavi over the old one, then every fix again.
+# Without a file it asks Citavi's download link whether there is a newer installer than ours.
+cmd_update() {
+  local msi=${1:-} fresh=1
+  need_bottle
+  local before="none"; citavi_installed && before=$(citavi_version)
+  if [[ -z "$msi" ]]; then
+    step "Looking for a newer Citavi installer"
+    need_closed
+    citavi_msi_fetch newer || fresh=0
+    msi=$CITAVI_MSI
+    if (( ! fresh )) && citavi_installed; then
+      ok "Citavi's download link offers the installer already used here — not installing again"
+      msi=
+    fi
+  fi
+  [[ -n "$msi" ]] && cmd_install "$msi"
+  cmd_registry
+  cmd_fonts
+  cmd_patch
+  print; cmd_doctor || true
+  print -- "
+Citavi before: $before   now: $(citavi_version)
+Now check that it really starts:   citavi-crossover diagnose
+If that reports an error, follow docs/ADAPTING.md."
+}
+
+# Starts Citavi, waits, and reports what is on screen — in particular the text of Citavi's
+# "A program error has occurred" dialog, which contains the .NET stack trace we need.
+cmd_diagnose() {
+  need_citavi; need_closed
+  local wait=${1:-40} out="$WORK/diagnose/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$out"
+  need_prebuilt
+  local tname="trace-${out:t}.log"; trace_on "$tname"
+  step "Starting Citavi and watching it for ${wait}s"
+  start_citavi "$out/$ENGINE.log"
+  pause $wait
+  wclick list > "$out/windows.txt"
+  local tops; tops=$(grep -c '^TOP' "$out/windows.txt")
+  if (( tops == 0 )); then
+    bad "no Citavi window appeared"
+    note "the process may have died early; look at the end of $out/$ENGINE.log"
+    grep -a -E "err:|Unhandled|Exception" "$out/$ENGINE.log" 2>/dev/null | tail -8 | cut -c1-220
+  else
+    ok "$tops window(s):"; grep '^TOP' "$out/windows.txt" | sed -E 's/^TOP [0-9A-F]+ pid=[0-9]+ \[[^]]*\] /        /'
+  fi
+  # Every rich-edit box: the error dialog keeps the exception there.
+  local h found=0
+  for h in $(grep -E 'RICHEDIT' "$out/windows.txt" | awk '{print $1}'); do
+    wclick gettext $h > "$out/text-$h.txt"
+    if grep -q -E "Exception|   at " "$out/text-$h.txt"; then
+      found=1; cp "$out/text-$h.txt" "$out/error.txt"
+      bad "Citavi reported a program error:"
+      grep -v '^[[:space:]]*$' "$out/error.txt" | sed 's/^/        /' | head -40
+    fi
+  done
+  # Plain message boxes (window class #32770), e.g. a new "Citavi requires …" check.
+  if grep -q '^TOP .*\[#32770\]' "$out/windows.txt"; then
+    found=1
+    bad "Citavi is showing a message box:"
+    awk '/^TOP /{box = ($0 ~ /\[#32770\]/); if (box) { t=$0; sub(/^[^"]*"/, "", t); sub(/".*$/, "", t); print "        [" t "]" } next}
+         box && /\[Static\] "[^"]/ { t=$0; sub(/^[^"]*"/, "", t); sub(/"[^"]*$/, "", t); print "        " t }' "$out/windows.txt" | tee "$out/messagebox.txt"
+  fi
+  local winlist="$WORK/bin/winlist"   # see plain_copy
+  mkdir -p "$WORK/bin"; cmp -s "$WINLIST" "$winlist" || { plain_copy "$WINLIST" "$winlist" && chmod 755 "$winlist"; }
+  if [[ -x "$winlist" ]]; then
+    # macOS names the owner of a window: the bottle with CrossOver, plain "wine" with Wine.
+    local owner=citavi; [[ $ENGINE == wine ]] && owner=wine
+    "$winlist" $owner | while IFS= read -r line; do
+      [[ "$line" == *"on=true"* ]] && screencapture -x -o -l ${line%%$'\t'*} -t png "$out/window-${line%%$'\t'*}.png" 2>/dev/null
+    done
+  fi
+  local clog="$WIN_HOME/AppData/Local/Swiss Academic Software/Citavi 7/Log/citavi.log"
+  [[ -s "$clog" ]] && cp "$clog" "$out/citavi.log"
+  if [[ -s "$STATE/logs/$tname" ]]; then
+    cp "$STATE/logs/$tname" "$out/trace.log"
+    print; print -- "Exceptions thrown inside Citavi so far, including the ones it handled quietly"
+    print -- "(a healthy start has two or three; full stacks in $out/trace.log):"
+    trace_summary "$out/trace.log" 12
+  fi
+  print
+  (( found == 0 && tops > 0 )) && print -- "${G}No error dialog.${N} Citavi is left running so you can look at it."
+  (( found )) && print -- "Next: docs/ADAPTING.md explains how to turn this into a fix.
+Close Citavi's dialog with ${B}Cancel${N} (on the error dialog, OK uploads a report to Citavi)."
+  print -- "Details saved in $out"
+}
+
+# Prints the newest exception trace (written by `run --trace` or `diagnose`).
+cmd_trace() {
+  need_bottle
+  local f; f=$(latest_trace); [[ -n "$f" ]] || die "no trace yet — start Citavi with: citavi-crossover run --trace"
+  if [[ "${1:-}" == --full ]]; then cat "$f"; return; fi
+  step "Exceptions in ${f:t}, in the order they first happened"
+  trace_summary "$f" 40
+  print -- "
+Full stack traces:  citavi-crossover trace --full | less
+The file:           $f"
+}
+
+cmd_decompile() {
+  need_citavi
+  command -v ilspycmd >/dev/null || die "ilspycmd is required: citavi-crossover deps"
+  local version; version=$(citavi_version)
+  local names=("$@"); (( $#names )) || names=(Citavi.exe SwissAcademic.dll SwissAcademic.Desktop.dll SwissAcademic.Citavi.dll SwissAcademic.Controls.dll)
+  local n dir src
+  for n in $names; do
+    dir="$WORK/decomp/$version/${n%.*}"
+    # prefer the untouched original when we have patched this file
+    src="$STATE/backup/$version/$n"; [[ -f "$src" ]] || src="$BIN/$n"
+    [[ -f "$src" ]] || { warn "$n not found"; continue; }
+    if [[ -d "$dir" ]]; then ok "$n already decompiled"; continue; fi
+    step "Decompiling $n"
+    mkdir -p "$dir"
+    ilspycmd -p -r "$BIN" -r "$FRAMEWORK" -o "$dir" "$src" >/dev/null 2>&1 && ok "$dir" || bad "$n failed"
+  done
+  print -- "Search it with:  grep -rn 'SomeMethod' '$WORK/decomp/$version' --include='*.cs'"
+}
+
+cmd_find() {
+  need_citavi; [[ -n "${1:-}" ]] || die "usage: citavi-crossover find 'Namespace.Type::Method'"
+  patcher find "$BIN_WIN" "$1"
+}
+
+cmd_scan() { need_citavi; patcher scan "$BIN_WIN" --rules "$RULES_WIN"; }
+
+cmd_help() {
+  cat <<EOF
+${B}citavi-crossover${N} — Citavi 7 in a CrossOver or Wine bottle on Apple Silicon  (now: $ENGINE_NAME, bottle '$BOTTLE_NAME')
+
+Everyday
+  setup [installer.msi]   do everything: check this Mac, bottle, .NET 4.8, registry fixes, fonts,
+                          Citavi, patches, login helper, final check. Safe to run again.
+  run [--log] [--trace] [file]
+                          start Citavi; --log adds a log from $ENGINE_NAME, --trace records every exception
+  doctor                  check every fix is still in place and say how to repair what is not
+  update [installer.msi]  install a newer Citavi over the old one, then re-apply all fixes;
+                          without a file, fetches the newest installer from Citavi if there is one
+  uninstall               remove what this tool installed, part by part, asking before each;
+                          your Citavi projects in Documents are never touched
+
+Individual steps
+  preflight               check this Mac: CrossOver or Wine, Rosetta, disk space
+  bottle                  create the bottle (and install .NET 4.8 into it)
+  dotnet                  install Microsoft .NET Framework 4.8 into the bottle
+  registry                apply patches/registry.conf and the Retina setting to the bottle
+  fonts                   copy the fonts in fonts/ into the bottle
+  install [installer.msi] run the Citavi installer silently (downloads it if there is none)
+  patch | unpatch         apply patches/rules.json to Citavi's assemblies | put the originals back
+  helper                  install and register the login helper app (with Wine also the app “Citavi 7”)
+
+When a new Citavi version breaks (see docs/ADAPTING.md)
+  diagnose [seconds]      start Citavi and print its error dialog and the exceptions it threw
+  trace [--full]          show the exceptions recorded by the last  run --trace  or  diagnose
+  decompile [file…]       decompile Citavi's assemblies to work/decomp/<version>/
+  find 'Type::Method'     list every place Citavi calls a given framework method
+  scan                    show what the current rules would change, without changing anything
+
+Working on this tool
+  deps                    check / install the developer tools (.NET SDK, Swift, ILSpy, msitools)
+  build                   rebuild the helpers in prebuilt/ after changing their source
+
+Options:  --yes     answer yes to every question (this accepts Microsoft's and Citavi's licence terms;
+                    with uninstall it removes without asking, except a bottle that setup did not make)
+          --guided  install .NET 4.8 through CrossOver's own window, which you click through,
+                    instead of unattended (with setup, bottle or dotnet; CrossOver only)
+          --force   close a running Citavi instead of stopping (unsaved changes are lost)
+Settings: $ROOT/config.sh   (CITAVI_ENGINE=wine or =crossover chooses between the two for one run)
+EOF
+}
+
+# ------------------------------------------------------------------ dispatch
+
+FORCE=0; GUIDED=0; ASSUME_YES=${CITAVI_ASSUME_YES:-0}; args=()
+for a in "$@"; do
+  case $a in
+    --force) FORCE=1 ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    --guided) GUIDED=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+cmd=${1:-help}; (( $# )) && shift
+
+case $cmd in
+  setup|run|doctor|update|uninstall|preflight|bottle|dotnet|registry|fonts|install|patch|unpatch|helper|diagnose|trace|decompile|find|scan|deps|build|help)
+    cmd_$cmd "$@" ;;
+  -h|--help) cmd_help ;;
+  *) print -u2 -- "unknown command: $cmd"; cmd_help; exit 2 ;;
+esac
