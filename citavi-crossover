@@ -473,7 +473,8 @@ cmd_preflight() {
     if [[ ! -x "$WINE" || ! -x "$WINESERVER" ]]; then
       bad "Wine is not installed"
       print -- "
-  1. Install Wine Stable. With Homebrew:   brew tap gcenx/wine && brew install --cask wine-stable
+  1. Install Wine Stable. With Homebrew:
+       brew tap gcenx/wine && brew trust gcenx/wine && brew install --cask wine-stable
      Without: the macOS page of https://gitlab.winehq.org/wine/wine/-/wikis/Download links to it.
   2. macOS marks every downloaded app, and refuses to start one that no registered developer
      signed. Wine is not signed, so take the mark off:

@@ -36,7 +36,7 @@ CrossOver is built on Wine. The tool works with either.
 | | CrossOver | Wine |
 |---|---|---|
 | Price | paid, with a free trial of 14 days | free |
-| To install it | download it and open it once | two Homebrew commands, or a download; then one command so that macOS lets it start |
+| To install it | download it and open it once | three Homebrew commands, or a download; then one command so that macOS lets it start |
 | Setup takes | about 15 minutes | about 20 minutes |
 | Citavi is started from | CrossOver's window | the app *Citavi 7* in `~/Applications`, which setup makes |
 | Tested with | CrossOver 26.3 | Wine Stable 11.0 |
@@ -122,12 +122,18 @@ account to sign in with. Wine itself is free. [Homebrew](https://brew.sh) is the
 install it, and step 1 also says how to do without. No developer tools are needed.
 
 **1. Install Wine Stable.** Open Terminal (it is in *Applications ▸ Utilities*). With Homebrew,
-paste these two lines one after the other, pressing Return after each. The first adds
+paste these three lines one after the other, pressing Return after each. The first adds
 `gcenx/wine`, the Homebrew tap (a source of packages) that provides Wine Stable. Homebrew's own
-list stopped offering it in September 2026, so without the tap the second line fails.
+list stopped offering it in September 2026, so without the tap the third line fails. The second
+tells Homebrew that you trust the tap: Homebrew installs from a tap that is not its own only
+after that.
 
 ```bash
 brew tap gcenx/wine
+```
+
+```bash
+brew trust gcenx/wine
 ```
 
 ```bash
