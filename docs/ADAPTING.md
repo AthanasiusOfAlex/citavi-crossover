@@ -167,6 +167,25 @@ Prefer fixes in this order. The earlier ones survive Citavi updates on their own
     answer (`value`), and makes the method begin with: if the first argument equals `when`, return
     `value`. Several such rules can name the same method with different inputs.
 
+11. **`return-registry-value-for-argument` rule** — the same, when the answer differs from Mac to
+    Mac and so cannot stand in the rule. The rule names an assembly, type and method as above and
+    a registry key (`key`, written `HKEY_CURRENT_USER\…`). After the tests of the kind above, the
+    method gets: if the key has a text value named like the first argument, return it. Something
+    has to write the values: the names of the Mac's default apps are written by `registry`
+    (`each_mac_app_fix` in `citavi-crossover`).
+
+12. **`temporary-copy-without-asking` rule** — when Citavi asks where to save a copy of a file
+    only to open or use that copy, and the question is a detour on a Mac. The rule names an
+    assembly, type and method. It finds each file dialog there that is followed by `File.Copy`
+    with no other dialog in between, and replaces the call that shows it by a call of an added
+    method, `CitaviCrossover_TemporaryCopy`: that puts the file name Citavi proposed into
+    `Citavi copies\<date>` in the bottle's folder for temporary files, deletes the folders of
+    earlier days, and answers OK. The call of `SetInitialDirectoryContext` between dialog and
+    copy, which remembers the dialog's folder, is taken out. `"then"` names a method that must be
+    called right after the copy (`StartProcessSafe`), for a method with several such dialogs of
+    which only one is to go. For an async method, name the method itself: the rule looks in the
+    class the compiler made for it. Run `scan` and see that it lists exactly the places you mean.
+
 Before writing any rule, search Citavi's code for an alternative it already contains. The cloud
 fix is an example: Citavi ships a second WebSocket implementation for old Windows versions, so
 the fix was one `return-constant` that selects it, not a replacement for the missing Windows
@@ -209,9 +228,10 @@ Add rules to `patches/rules.json`:
 }
 ```
 
-The last six kinds each have one rule in `patches/rules.json` to copy from:
+The last eight kinds each have a rule in `patches/rules.json` to copy from:
 `text-field-border-fill`, `text-field-auto-height-width`, `word-processor-caret-positions`,
-`task-slider-thumb`, `friendly-program-name` and `browser-name`.
+`task-slider-thumb`, `friendly-program-name`, `browser-name`, `mac-app-name` and
+`open-copy-preview`.
 The comment at the top of that file lists the properties every kind takes.
 
 Always fill in `why` with the symptom and the cause. It is the only documentation the next
@@ -266,6 +286,8 @@ with its entry in `cache.info`, and reopen the project. Everything must come bac
 | A name in a task ("@Ada Lovelace") or any other text with a no-break space has a gap more than twice as wide as a space. Greek, Cyrillic and Hebrew text in a text field is a row of such gaps. No exception. | Selawik has only Latin letters and lacks a few characters that Segoe UI has, the no-break space (U+00A0) among them. Citavi's text fields are rich edit controls; Wine's draws all text by glyph number and so cannot borrow a missing character from another font (GDI+ can; `DrawText` cannot either). It draws the font's "missing" glyph, which in Selawik is blank and 0.65 em wide (16 pixels where a space has 7). Measured with a probe in the bottle. | `fonts/build-fonts.py` builds the fonts in `fonts/` from Selawik: six characters get the glyph of the space, the hyphen or the apostrophe, and about 2600 more (Greek, modern and ancient, Cyrillic, Hebrew, º, ª and others) are copied from Open Sans and Noto Sans, scaled to Selawik's letter heights. The result is named Bottle UI, because Selawik's licence reserves its name for the unchanged font. Arabic and East Asian scripts are still missing; `fonts/README.md` says how to add a font for them |
 | Italic text, such as the title on the Overview tab, is upright letters pushed over | Selawik has no italic fonts, and Wine slants the upright one where a program asks for italic. | `fonts/build-fonts.py` also builds an italic face for each weight from Noto Sans Italic, scaled the same way and given Selawik's line heights |
 | The button that opens a web address or a file names the program in garbled letters ("Open in hªĺžÿo"). It works. No exception. | Citavi asks for the program's friendly name with four calls of `AssocQueryString`, the third without a buffer but with the size it just learned. Its declaration names no character set, so .NET calls `AssocQueryStringA`. Wine's answers that third call with size 0 where `AssocQueryStringW` answers with the size needed; the fourth call then gets no room and Citavi reads back what the memory held. Measured with a probe in the bottle. | rule: `friendly-program-name` makes the declaration call the 16-bit form. The name is then Wine's: "winebrowser", its helper that hands the address or file to the Mac's default program. Rule: `browser-name` makes Citavi's function answer "browser" for `.html`, which is what it asks about for every web address, so that button reads "Open in browser" |
+| The button that opens a linked PDF or picture reads "Open in winebrowser". It works: the file opens in the Mac's default app. No exception. | Citavi shows the friendly name of the program that opens the file's ending. In a bottle that is winebrowser, Wine's helper that hands the file to the Mac, and Wine takes the name from the program file; it has no registry value for it. | `registry` asks the Mac for its default app for PDFs and pictures and writes the names into `HKCU\Software\citavi-crossover\Mac apps`; rule: `mac-app-name` makes Citavi's function read them there, so the button reads "Open in Preview" |
+| In a cloud project "Open copy in …" first shows a "Save As" window, which starts in the folder last used (possibly one inside the bottle), and opens the PDF only after Save. No exception. | Citavi's design, on Windows too: a cloud attachment is opened as a copy, and Citavi asks where to put the copy. The code is in three places: the preview's button, the command of the attachment list, and the attachment's properties window. | rules: `open-copy-preview`, `open-copy-attachment-list` and `open-copy-attachment-window` replace the call that shows the window by an added method that names a file in `Temp\Citavi copies\<date>` and answers OK. "Save a copy as…" in the preview's Tools menu still asks |
 
 [WINE-DIFFERENCES.md](WINE-DIFFERENCES.md) has the same faults from Wine's side: what Windows
 answers and what Wine answers, measured, where the cause is in Wine's source, and which fixes a

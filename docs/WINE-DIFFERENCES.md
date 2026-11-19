@@ -209,6 +209,13 @@ Not checked against current Wine, and not measured with a test program.
 - `managed-websocket-tls12`: the WebSocket library that Citavi ships as a fallback defaults to
   SSL 3 and TLS 1.0. That is Citavi's code.
 - `browser-name`: a choice of wording for a button.
+- `mac-app-name`: Wine's name for the program that opens a PDF, "winebrowser", is correct as far
+  as the bottle goes; the app that really opens it is on the Mac, and only the Mac knows its name.
+  (Wine takes a program's friendly name from the program file alone. Windows also looks in the
+  registry, under `FriendlyAppName`, which a fix could have used had Wine read it.)
+- `open-copy-preview`, `open-copy-attachment-list`, `open-copy-attachment-window`: Citavi asks
+  where to save the copy of a cloud attachment on Windows too. Skipping the question is a choice
+  for the Mac, where the copy is only wanted in Preview.
 - The fonts: Segoe UI is proprietary, so no bottle has it.
 
 ## Wine bugs near these faults

@@ -420,8 +420,9 @@ Retina mode, whatever the two settings say.
 | Microsoft .NET Framework 4.0 and 4.8, replacing the Wine Mono stand-in a new bottle comes with | the bottle | `DOTNET_STEPS` in `citavi-crossover` |
 | 14 registry values: 4 that let Citavi start and preview PDFs, 10 that set its fonts | bottle registry | `patches/registry.conf` |
 | 2 registry values for Retina mode | bottle registry | `RETINA` in `config.sh` |
+| Up to 5 registry values with the names of the Mac's default apps for PDFs and pictures, for Citavi's “Open in …” buttons | bottle registry, `HKCU\Software\citavi-crossover\Mac apps` | `MAC_APP_TYPES` in `citavi-crossover` |
 | 10 font files (Bottle UI, built from Selawik, Open Sans and Noto Sans) | `C:\windows\Fonts` in the bottle | `fonts/` |
-| 15 places in 7 assemblies (`Citavi.exe`, `SwissAcademic.dll`, `SwissAcademic.Citavi.dll`, `SwissAcademic.Controls.dll`, `SwissAcademic.Desktop.dll`, `WebSocket4Net.dll`, `Infragistics4.Win.v25.2.dll`) | Citavi's `bin` folder in the bottle | `patches/rules.json` |
+| 19 places in 7 assemblies (`Citavi.exe`, `SwissAcademic.dll`, `SwissAcademic.Citavi.dll`, `SwissAcademic.Controls.dll`, `SwissAcademic.Desktop.dll`, `WebSocket4Net.dll`, `Infragistics4.Win.v25.2.dll`) | Citavi's `bin` folder in the bottle | `patches/rules.json` |
 | Untouched originals of patched files, the tool's own Windows programs, logs | `C:\citavi-crossover\` in the bottle | — |
 | `CitaviTrace.dll`, the exception tracer (inactive unless `run --trace` or `diagnose` switches it on) | Citavi's `bin` folder in the bottle | `dev/trace/Trace.cs` |
 | *Citavi Login Helper.app*, the default handler for `citavi://` links, signed for this Mac only | `~/Applications` | `login-helper/main.swift` |
@@ -467,8 +468,17 @@ instead, see *Working on the tool*.
   fields cannot borrow a missing letter from another font. [fonts/README.md](fonts/README.md)
   says how to add more.
 - The button that opens a web address says **Open in browser**, not the browser's name. The
-  button that opens a linked file, a PDF for one, says **Open in winebrowser**: that is Wine's
-  helper that hands the file to the Mac's default program for it.
+  button that opens a PDF or a picture names the Mac's default app for it (**Open in Preview**).
+  The name is looked up when `registry` runs: after choosing another default app on the Mac, run
+  `./citavi-crossover registry` again (`doctor` says so too). For other kinds of file the button
+  is as Wine has it: **Open in winebrowser**, or **Open in Windows** for a kind the bottle has no
+  program for.
+- **Open copy in Preview**, the button for an attachment of a cloud project, opens the PDF at
+  once. On Windows Citavi first asks where to save the copy; here the copy goes into a folder for
+  temporary files inside the bottle (`Citavi copies` in the Windows user's `AppData\Local\Temp`),
+  and the first copy of a day deletes the copies of earlier days. Notes you add to such a copy in
+  Preview are therefore lost unless you save it somewhere else. To choose the place yourself, use
+  **Save a copy as…** in the **Tools** menu of Citavi's preview, which still asks.
 - The unattended .NET install leaves out **.NET Framework 2.0**, which CrossOver's own .NET
   package installs first. Citavi does not use it.
 - Intel Macs, CrossOver versions other than 26.3 and Wine versions other than 11.0 have not been

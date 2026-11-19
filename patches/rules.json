@@ -20,6 +20,15 @@
   //                         ask for the 16-bit form.
   // kind "return-constant-for-argument": assembly!type::method takes a string first and returns a string. It begins
   //                         with a new statement: if the first argument equals `when`, return `value`.
+  // kind "return-registry-value-for-argument": assembly!type::method takes a string first and returns a string. After
+  //                         the tests of the kind above it gets a new statement: if the registry key `key` has a text
+  //                         value named like the first argument, return that text. `key` is written as .NET wants it
+  //                         (HKEY_CURRENT_USER\...); `citavi-crossover registry` writes the values.
+  // kind "temporary-copy-without-asking": in assembly!type::method, a file dialog whose answer is the target of a
+  //                         File.Copy is not shown. An added method answers for it: it puts the file name the program
+  //                         proposed into a folder for temporary copies and says OK. The statement that remembers the
+  //                         dialog's folder for next time is taken out. Optional "then" limits the rule to copies that
+  //                         are followed at once by a call of a method of that name.
   // In "assembly", * stands for any text (for libraries with their version in the file name).
   // Set "enabled": false to switch a rule off without deleting it.
   "rules": [
@@ -126,7 +135,42 @@
       "method": "GetExecutablesFriendlyName",
       "when": ".html",
       "value": "browser",
-      "why": "With friendly-program-name the button that opens a web address reads 'Open in winebrowser', where Windows names the browser ('Open in Microsoft Edge'). For every web address Citavi asks for the friendly name of the program that opens '.html' (UriUtility.GetExecutablesFriendlyName passes that literal). In a bottle that program is always winebrowser, Wine's helper that hands the address to the Mac's default browser, and the name Wine returns for it is the file name without its ending (measured with a probe: 'winebrowser' for .html, .pdf and http). The patch makes Citavi's function answer 'browser' for '.html' without asking. It is one word for every interface language. Other file types are not changed: a PDF's button still names winebrowser, which there stands for the Mac's default program for the file."
+      "why": "With friendly-program-name the button that opens a web address reads 'Open in winebrowser', where Windows names the browser ('Open in Microsoft Edge'). For every web address Citavi asks for the friendly name of the program that opens '.html' (UriUtility.GetExecutablesFriendlyName passes that literal). In a bottle that program is always winebrowser, Wine's helper that hands the address to the Mac's default browser, and the name Wine returns for it is the file name without its ending (measured with a probe: 'winebrowser' for .html, .pdf and http). The patch makes Citavi's function answer 'browser' for '.html' without asking. It is one word for every interface language. For a file the name is the Mac app's: see mac-app-name."
+    },
+    {
+      "id": "mac-app-name",
+      "kind": "return-registry-value-for-argument",
+      "assembly": "SwissAcademic.dll",
+      "type": "System.IO.Path2",
+      "method": "GetExecutablesFriendlyName",
+      "key": "HKEY_CURRENT_USER\\Software\\citavi-crossover\\Mac apps",
+      "why": "The button that opens a linked file reads 'Open in winebrowser', for an attachment of a cloud project 'Open copy in winebrowser', where Windows names the program ('Open in Adobe Acrobat'). Citavi asks Windows for the friendly name of the program that opens the file's ending ('.pdf'). In a bottle that program is winebrowser, Wine's helper that hands the file to the Mac's default app for it, and Wine takes a program's friendly name from the program file alone: its description, or else its file name (measured with a probe: 'winebrowser' for .pdf). The registry values where Windows keeps such names, FriendlyAppName and MuiCache, do not occur in the shell32.dll, shlwapi.dll or kernelbase.dll of CrossOver 26.3, so no registry fix can change the name. The true answer is on the Mac and differs from Mac to Mac. `citavi-crossover registry` therefore asks the Mac which app opens PDFs and pictures and writes each app's name, as Finder shows it, into HKCU\\Software\\citavi-crossover\\Mac apps: one value per file ending ('.pdf' = 'Preview'). The patch makes Citavi's function look there first; for a file ending without a value it asks Windows as before, and the test of browser-name stays in front. The function is in SwissAcademic.dll, a library built for .NET Standard, whose core library 'netstandard' does not pass on the Registry class (a first attempt failed with TypeLoadException: Could not load type 'Microsoft.Win32.Registry' from assembly 'netstandard'). The patch names the class in mscorlib itself, which adds mscorlib to the libraries SwissAcademic.dll refers to. Checked with a test program in the bottle that calls the patched function: '.pdf' and '.PDF' give 'Preview', '.html' gives 'browser', an empty text and no text give 'Windows' as before; a name with letters outside ASCII ('Aperçu') is stored whole. In Citavi the menu of the attachment list then reads 'Open copy in Preview' and the button in the attachment's window likewise."
+    },
+    {
+      "id": "open-copy-preview",
+      "kind": "temporary-copy-without-asking",
+      "assembly": "Citavi.exe",
+      "type": "SwissAcademic.Citavi.Shell.Controls.Preview.PreviewControl",
+      "method": "PerformCommand",
+      "then": "StartProcessSafe",
+      "why": "In a cloud project the preview's button 'Open copy in <program>' first shows a 'Save As' window, Wine's stand-in for the Windows one, and only after a click on Save opens the PDF, which then does appear in the Mac's default app. Citavi does the same on Windows: the file of a cloud attachment in its cache is not to be edited, so it asks where to put a copy (SaveFileDialog), copies the file there (File.Copy) and opens the copy (Program.StartProcessSafe). On a Mac the window is an extra step in an unfamiliar file browser that starts in the folder last used, which can be a folder inside the bottle. The patch replaces the one call that shows the window by a call of an added method, CitaviCrossover_TemporaryCopy, which puts the file name Citavi proposed (the attachment's name) into the folder 'Citavi copies\\<today's date>' in the bottle's folder for temporary files (C:\\users\\<name>\\AppData\\Local\\Temp) and answers OK; Citavi then copies and opens as before. The first copy of a day deletes the folders of earlier days, so the copies do not pile up. If the method fails, it shows the window after all. The statement after the window that remembers its folder for the next time is taken out (its three values are dropped from the stack), so 'Save a copy as…', which shares that memory and still asks, does not start in the temporary folder. PerformCommand is an async method; its code is in the class the compiler made for it, <PerformCommand>d__172, and the method has a second save window, that of 'Save a copy as…', which is not followed by StartProcessSafe and stays. Checked with a test program in the bottle that calls the added method twice: both answers OK, both files named into Citavi copies\\2026-11-19 with their dash, quotes and é intact, and a folder 2026-01-01 put there beforehand gone. In Citavi itself this place was not clicked: the command is in the menu that a right-click on the PDF brings up, and the test helper's simulated clicks do not reach that part (it is WPF). The two other places, which call the same added method, were (see open-copy-attachment-list). On the first copy of a day an exception trace shows one DirectoryNotFoundException for 'Citavi copies': that is the deleting of a folder that is not there yet, and it is caught."
+    },
+    {
+      "id": "open-copy-attachment-list",
+      "kind": "temporary-copy-without-asking",
+      "assembly": "Citavi.exe",
+      "type": "SwissAcademic.Citavi.Shell.MainForm",
+      "method": "PerformCommand",
+      "then": "StartProcessSafe",
+      "why": "The same save window as in open-copy-preview, in the second place where Citavi opens a copy of a cloud attachment: the command OpenLocationInDefaultProgram, which is 'Open copy in <program>' in the menu of the list of attachments on the Reference tab, and works for any kind of file. The code is the same three steps (SaveFileDialog, File.Copy, Program.StartProcessSafe) in MainForm's async PerformCommand, class <PerformCommand>d__1210. The patch sends the call that shows the window to the method added by open-copy-preview; the other dialogs of that long method are not followed by a File.Copy and a StartProcessSafe and stay. Checked in Citavi 7.4.1.3 with a cloud project: with a PDF attachment selected, Ctrl+Alt+O showed no window, the copy was in Temp\\Citavi copies\\2026-11-19 under the attachment's name, and Preview had it open."
+    },
+    {
+      "id": "open-copy-attachment-window",
+      "kind": "temporary-copy-without-asking",
+      "assembly": "Citavi.exe",
+      "type": "SwissAcademic.Citavi.Shell.LocationForm",
+      "method": "SaveAsCopy",
+      "why": "The same save window as in open-copy-preview, in the third place: the button 'Open copy in <program>' in the window with an attachment's properties (LocationForm). Its method SaveAsCopy asks where to put the copy and copies the file; the caller opens it. SaveAsCopy has no other use, so the rule needs no 'then'. Checked in Citavi 7.4.1.3: the button, which reads 'Open copy in Preview', opened the PDF in Preview with no window in between."
     }
   ]
 }

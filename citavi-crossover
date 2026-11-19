@@ -345,6 +345,64 @@ each_display_fix() {
   fi
 }
 
+# The names of the Mac's apps. A button of Citavi's that opens a file names the program that will
+# open it ("Open in Adobe Acrobat"). In a bottle that program is winebrowser, Wine's helper that
+# hands the file to the Mac's default app for it. So the Mac is asked which app that is, and the
+# app's name as Finder shows it ("Preview") is written into the bottle, where the patch rule
+# mac-app-name makes Citavi read it. Which app opens a file is a setting of the Mac, not a fixed
+# repair, so this lives here and not in registry.conf: after choosing another default app, run
+# `citavi-crossover registry` again.
+MAC_APP_KEY='HKCU\Software\citavi-crossover\Mac apps'   # the key named in patches/rules.json (mac-app-name)
+MAC_APP_TYPES=(pdf png jpg jpeg gif)                     # the file types a bottle hands to winebrowser, web pages aside
+MAC_APPS=; MAC_APPS_ASKED=0
+# Fills MAC_APPS, once per run, with one line per file type that has a default app: <type><tab><name>.
+mac_apps_ask() {
+  (( MAC_APPS_ASKED )) && return 0
+  MAC_APPS_ASKED=1
+  MAC_APPS=$(osascript -l JavaScript - $MAC_APP_TYPES 2>/dev/null <<'JS'
+ObjC.import('AppKit');
+function run(argv) {
+  $.NSBundle.bundleWithPath('/System/Library/Frameworks/UniformTypeIdentifiers.framework').load;
+  var UTType = $.NSClassFromString('UTType'), out = [];
+  argv.forEach(function (ext) {
+    var type = UTType.typeWithFilenameExtension(ext);
+    if (type.isNil()) return;
+    var app = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenContentType(type);
+    if (app.isNil()) return;
+    var name = $.NSFileManager.defaultManager.displayNameAtPath(app.path).js.replace(/\.app$/, '');
+    if (name) out.push(ext + '\t' + name);
+  });
+  return out.join('\n');
+}
+JS
+)
+}
+each_mac_app_fix() {
+  local cb=$1 line
+  mac_apps_ask
+  for line in ${(f)MAC_APPS}; do
+    $cb "mac-app-${line%%$'\t'*}" "$MAC_APP_KEY" ".${line%%$'\t'*}" REG_SZ "${line#*$'\t'}"
+  done
+}
+apply_mac_app() { apply_fix "$@" >/dev/null && ok "$1: $5" || bad "$1"; }
+# check_mac_app: what check_fix does, for these names. `reg query` prints its answer in an old
+# Windows character set that has no “ç”, Greek or Chinese, and a Mac set to French or Chinese has
+# app names with such letters. A registry export is Unicode, so the key is exported, once per run.
+MAC_APPS_HAVE=
+check_mac_app() {
+  local id=$1 name=$3 data=$5 have
+  if [[ -z "$MAC_APPS_HAVE" ]]; then
+    mkdir -p "$TOOLS"; rm -f "$TOOLS/mac-apps.reg"
+    bwine reg export "$MAC_APP_KEY" "$TOOLS_WIN\\mac-apps.reg" /y /reg:64 >/dev/null 2>&1
+    MAC_APPS_HAVE=$(iconv -f UTF-16 -t UTF-8 "$TOOLS/mac-apps.reg" 2>/dev/null | tr -d '\r')
+    MAC_APPS_HAVE=${MAC_APPS_HAVE:-none}; rm -f "$TOOLS/mac-apps.reg"
+  fi
+  have=$(print -r -- "$MAC_APPS_HAVE" | grep -i -F "\"$name\"=\"" | head -1)
+  have=${${have#*=\"}%\"}; have=${have//\\\"/\"}; have=${have//\\\\/\\}      # a .reg file writes \" and \\
+  if [[ "$have" == "$data" ]]; then ok "registry: $id ($data)"
+  else bad "registry: $id — the Mac opens these files with $data, the bottle has '${have:-nothing}'"; FIX_PROBLEMS=$((FIX_PROBLEMS+1)); fi
+}
+
 # ------------------------------------------------------------------ commands
 
 # Developer tools. Nobody needs these to install or run Citavi: only to rebuild the helpers in
@@ -733,6 +791,9 @@ cmd_registry() {
   step "Display (RETINA=$RETINA in config.sh)"
   each_display_fix apply_fix
   citavi_running && note "display changes take effect after you quit Citavi and start it again"
+  step "Names of the Mac's apps (for Citavi's “Open in …” buttons)"
+  each_mac_app_fix apply_mac_app
+  [[ -n "$MAC_APPS" ]] || note "this Mac names no default app for PDFs or pictures; the buttons say “winebrowser”"
   return 0
 }
 
@@ -1046,7 +1107,7 @@ cmd_doctor() {
   if [[ -d "$BOTTLE/drive_c" ]]; then need_own_bottle; ok "'$BOTTLE_NAME' at $BOTTLE"; else bad "bottle '$BOTTLE_NAME' not found — run: citavi-crossover setup"; exit 1; fi
   if dotnet_ok; then ok "Microsoft .NET Framework 4.8"
   else bad "Microsoft .NET Framework 4.8 is missing in the bottle"; note "fix with: citavi-crossover setup"; exit 1; fi
-  FIX_PROBLEMS=0; each_registry_fix check_fix; each_display_fix check_fix; problems=$((problems+FIX_PROBLEMS))
+  FIX_PROBLEMS=0; each_registry_fix check_fix; each_display_fix check_fix; each_mac_app_fix check_mac_app; problems=$((problems+FIX_PROBLEMS))
   (( FIX_PROBLEMS )) && note "fix with: citavi-crossover registry"
   local missing; missing=$(fonts_missing)
   if [[ -z "$missing" ]]; then ok "fonts: Bottle UI, built from Selawik, Open Sans and Noto Sans (stands in for Segoe UI)"
@@ -1063,9 +1124,9 @@ cmd_doctor() {
     local out; out=$(patcher verify "$BIN_WIN" --rules "$RULES_WIN"); local rc=$?
     case $rc in
       0) ok "all IL patches applied" ;;
-      1) bad "IL patches missing (Citavi was updated or reinstalled)"; print -- "$out" | sed 's/^/        /'; note "fix with: citavi-crossover patch"; problems=$((problems+1)) ;;
-      3) warn "a patch rule no longer matches this version"; print -- "$out" | sed 's/^/        /'; note "see docs/ADAPTING.md" ;;
-      *) bad "patch check failed"; print -- "$out" | sed 's/^/        /'; problems=$((problems+1)) ;;
+      1) bad "IL patches missing (Citavi was updated or reinstalled)"; print -r -- "$out" | sed 's/^/        /'; note "fix with: citavi-crossover patch"; problems=$((problems+1)) ;;
+      3) warn "a patch rule no longer matches this version"; print -r -- "$out" | sed 's/^/        /'; note "see docs/ADAPTING.md" ;;
+      *) bad "patch check failed"; print -r -- "$out" | sed 's/^/        /'; problems=$((problems+1)) ;;
     esac
   else
     bad "Citavi is not installed — run: citavi-crossover setup"; problems=$((problems+1))
@@ -1486,7 +1547,8 @@ Individual steps
   preflight               check this Mac: CrossOver or Wine, Rosetta, disk space
   bottle                  create the bottle (and install .NET 4.8 into it)
   dotnet                  install Microsoft .NET Framework 4.8 into the bottle
-  registry                apply patches/registry.conf and the Retina setting to the bottle
+  registry                apply patches/registry.conf, the Retina setting and the names of the
+                          Mac's default apps to the bottle
   fonts                   copy the fonts in fonts/ into the bottle
   install [installer.msi] run the Citavi installer silently (downloads it if there is none)
   patch | unpatch         apply patches/rules.json to Citavi's assemblies | put the originals back

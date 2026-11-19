@@ -19,7 +19,7 @@ public sealed class RuleSet
 public sealed class Rule
 {
     public string Id { get; set; } = "";
-    /// <summary>redirect-call | return-constant | set-field-constant | fill-region-as-rectangles | set-field-to-window-width | complete-character-placement | draw-trackbar-thumb | wide-character-call | return-constant-for-argument</summary>
+    /// <summary>redirect-call | return-constant | set-field-constant | fill-region-as-rectangles | set-field-to-window-width | complete-character-placement | draw-trackbar-thumb | wide-character-call | return-constant-for-argument | return-registry-value-for-argument | temporary-copy-without-asking</summary>
     public string Kind { get; set; } = "";
     public string Why { get; set; } = "";
     public bool Enabled { get; set; } = true;
@@ -71,6 +71,21 @@ public sealed class Rule
     // that asks Windows something whose answer under Wine is known and unhelpful for one input.
     // Uses Assembly, Type, Method, When, Value (a string).
     public string? When { get; set; }
+
+    // return-registry-value-for-argument: Assembly!Type::Method takes a string first and returns a string.
+    // After the tests of return-constant-for-argument it gets a new statement: if the registry key Key
+    // has a text value named like the first argument, return that text. For an answer that differs
+    // from Mac to Mac, which `citavi-crossover registry` writes into the bottle.
+    // Uses Assembly, Type, Method, Key (written as .NET wants it: HKEY_CURRENT_USER\...).
+    public string? Key { get; set; }
+
+    // temporary-copy-without-asking: in Assembly!Type::Method (for an async method: in the class the
+    // compiler made for its code), a file dialog whose result is used as the target of File.Copy is
+    // not shown. An added method answers in its place: it names a file in a folder for temporary
+    // copies and says OK. The statement that remembers the dialog's folder for next time is taken out.
+    // Then, if given, limits the rule to copies that are followed at once by a call of a method of
+    // that name. Uses Assembly, Type, Method, Then.
+    public string? Then { get; set; }
 }
 
 public sealed class Manifest
@@ -209,6 +224,14 @@ internal static class Program
                 case "return-constant-for-argument":
                     if (r.Assembly == null || r.Type == null || r.Method == null || r.When == null || r.Value?.ValueKind != JsonValueKind.String)
                         throw new UserError($"rule {r.Id}: return-constant-for-argument needs assembly, type, method, when (text) and value (text)");
+                    break;
+                case "return-registry-value-for-argument":
+                    if (r.Assembly == null || r.Type == null || r.Method == null || r.Key == null || !r.Key.StartsWith("HKEY_"))
+                        throw new UserError($"rule {r.Id}: return-registry-value-for-argument needs assembly, type, method and key (HKEY_CURRENT_USER\\...)");
+                    break;
+                case "temporary-copy-without-asking":
+                    if (r.Assembly == null || r.Type == null || r.Method == null)
+                        throw new UserError($"rule {r.Id}: temporary-copy-without-asking needs assembly, type and method");
                     break;
                 default: throw new UserError($"rule {r.Id}: unknown kind '{r.Kind}'");
             }
@@ -527,8 +550,228 @@ internal static class Program
                     md.Body.OptimizeMacros();
                 }
             }
+            else if (rule.Kind == "return-registry-value-for-argument")
+            {
+                // after the tests of return-constant-for-argument the method gets:
+                //   string s = Registry.GetValue(key, firstArgument, null) as string;  if (!string.IsNullOrEmpty(s)) return s;
+                if (!IsAssembly(name, rule.Assembly)) continue;
+                var type = module.GetTypes().FirstOrDefault(t => t.FullName.Replace('/', '+') == rule.Type);
+                var methods = type?.Methods.Where(m => m.Name == rule.Method && m.HasBody && m.ReturnType.FullName == "System.String"
+                    && m.Parameters.Count > 0 && m.Parameters[0].ParameterType.FullName == "System.String").ToList() ?? new();
+                if (methods.Count == 0)
+                {
+                    hits.Add(new Hit(name, rule.Id, $"MISSING {rule.Type}::{rule.Method} (taking a string first and returning a string)"));
+                    continue;
+                }
+                foreach (var md in methods)
+                {
+                    var start = md.Body.Instructions;
+                    if (start.Any(i => i.OpCode == OpCodes.Ldstr && (string)i.Operand == rule.Key
+                                       && i.Next?.Next?.Next?.Operand is MethodReference get && get.Name == "GetValue")) continue;
+                    hits.Add(new Hit(name, rule.Id, $"{md.DeclaringType.FullName}::{md.Name}  (answers from {rule.Key})"));
+                    if (!mutate) continue;
+                    // Registry is named in mscorlib itself: a library built for .NET Standard (SwissAcademic.dll is one)
+                    // has "netstandard" as its core library, which passes on most types but not this one.
+                    var mscorlib = module.AssemblyReferences.FirstOrDefault(a => a.Name == "mscorlib");
+                    if (mscorlib == null)
+                    {
+                        mscorlib = new AssemblyNameReference("mscorlib", new Version(4, 0, 0, 0)) { PublicKeyToken = new byte[] { 0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89 } };
+                        module.AssemblyReferences.Add(mscorlib);
+                    }
+                    var registry = new TypeReference("Microsoft.Win32", "Registry", module, mscorlib);
+                    var getValue = new MethodReference("GetValue", module.TypeSystem.Object, registry);
+                    getValue.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+                    getValue.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+                    getValue.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+                    var isNullOrEmpty = new MethodReference("IsNullOrEmpty", module.TypeSystem.Boolean, module.TypeSystem.String);
+                    isNullOrEmpty.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+                    md.Body.SimplifyMacros(); // short branches become long ones, so the added instructions cannot push a target out of reach
+                    int at = 0; // behind the tests of return-constant-for-argument, each ldarg, ldstr, call, brfalse, ldstr, ret
+                    while (at + 6 < start.Count && start[at + 1].OpCode == OpCodes.Ldstr && start[at + 5].OpCode == OpCodes.Ret) at += 6;
+                    var first = start[at];
+                    var head = Instruction.Create(OpCodes.Ldstr, rule.Key!);
+                    var none = Instruction.Create(OpCodes.Pop);
+                    for (int i = 0; i < at; i++) if (ReferenceEquals(start[i].Operand, first)) start[i].Operand = head; // the last test went on to `first`
+                    var il = md.Body.GetILProcessor();
+                    il.InsertBefore(first, head);
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Ldarg, md.Parameters[0]));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Ldnull));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Call, module.ImportReference(getValue)));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Isinst, module.TypeSystem.String));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Dup));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Call, module.ImportReference(isNullOrEmpty)));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Brtrue, none));
+                    il.InsertBefore(first, Instruction.Create(OpCodes.Ret));
+                    il.InsertBefore(first, none);
+                    md.Body.OptimizeMacros();
+                }
+            }
+            else if (rule.Kind == "temporary-copy-without-asking")
+            {
+                // dialog.ShowDialog(owner), where File.Copy follows, becomes CitaviCrossover_TemporaryCopy(dialog, owner)
+                if (!IsAssembly(name, rule.Assembly)) continue;
+                var type = module.GetTypes().FirstOrDefault(t => t.FullName.Replace('/', '+') == rule.Type);
+                // the method itself and, for an async method, the class the compiler made for its code
+                var bodies = type == null ? new List<MethodDefinition>() : type.Methods.Where(m => m.Name == rule.Method)
+                    .Concat(type.NestedTypes.Where(n => n.Name.StartsWith("<" + rule.Method + ">")).SelectMany(n => n.Methods))
+                    .Where(m => m.HasBody).ToList();
+                bool found = false;
+                foreach (var md in bodies)
+                {
+                    if (md.Body.Instructions.Any(i => i.Operand is MethodReference mr && mr.Name == TemporaryCopyName)) found = true; // done earlier
+                    foreach (var (dialog, remember) in DialogsBeforeCopy(md, rule.Then))
+                    {
+                        found = true;
+                        hits.Add(new Hit(name, rule.Id, $"{md.DeclaringType.FullName}::{md.Name}  (copy without a save dialog)"));
+                        if (!mutate) continue;
+                        dialog.Operand = TemporaryCopyHelper(module, type!, (MethodReference)dialog.Operand);
+                        dialog.OpCode = OpCodes.Call;
+                        if (remember == null) continue;
+                        // the call that remembers the dialog's folder becomes: drop what was put on the stack for it
+                        var call = (MethodReference)remember.Operand;
+                        int values = call.Parameters.Count + (call.HasThis ? 1 : 0);
+                        remember.OpCode = OpCodes.Pop; remember.Operand = null; // same instruction object: branches to it stay valid
+                        var il = md.Body.GetILProcessor();
+                        for (int i = 1; i < values; i++) il.InsertAfter(remember, Instruction.Create(OpCodes.Pop));
+                    }
+                }
+                if (!found) hits.Add(new Hit(name, rule.Id, $"MISSING {rule.Type}::{rule.Method} no longer shows a file dialog and then copies a file{(rule.Then == null ? "" : " and calls " + rule.Then)}"));
+            }
         }
         return hits;
+    }
+
+    const string TemporaryCopyName = "CitaviCrossover_TemporaryCopy";
+
+    /// <summary>
+    /// The places in a method where a file dialog is shown and File.Copy comes next: for each, the call
+    /// of CommonDialog.ShowDialog(owner) and, if there is one between the two, the call of
+    /// SetInitialDirectoryContext (Citavi's "remember this folder for next time"). The code is read in
+    /// the order it stands in the method; a dialog counts when no other dialog is shown before the copy.
+    /// With <paramref name="then"/>, the copy must also be followed, before the code branches or leaves
+    /// its block, by a call of a method of that name.
+    /// </summary>
+    static List<(Instruction Dialog, Instruction? Remember)> DialogsBeforeCopy(MethodDefinition md, string? then)
+    {
+        var found = new List<(Instruction, Instruction?)>();
+        var il = md.Body.Instructions;
+        static bool Calls(Instruction i, string method, string? type = null) =>
+            i.Operand is MethodReference mr && mr.Name == method && (type == null || mr.DeclaringType.FullName == type);
+        for (int c = 0; c < il.Count; c++)
+        {
+            if (!Calls(il[c], "ShowDialog", "System.Windows.Forms.CommonDialog") || ((MethodReference)il[c].Operand).Parameters.Count != 1) continue;
+            Instruction? remember = null;
+            int copy = -1;
+            for (int j = c + 1; j < il.Count && !Calls(il[j], "ShowDialog"); j++)
+            {
+                if (remember == null && Calls(il[j], "SetInitialDirectoryContext") && ((MethodReference)il[j].Operand).ReturnType.FullName == "System.Void") remember = il[j];
+                if (Calls(il[j], "Copy", "System.IO.File")) { copy = j; break; }
+            }
+            if (copy < 0) continue;
+            if (then != null)
+            {
+                bool follows = false;
+                for (int k = copy + 1; k < il.Count && il[k].OpCode.FlowControl is FlowControl.Next or FlowControl.Call; k++)
+                    if (Calls(il[k], then)) { follows = true; break; }
+                if (!follows) continue;
+            }
+            found.Add((il[c], remember));
+        }
+        return found;
+    }
+
+    /// <summary>
+    /// Adds to a class (once per program file; other classes then call the same one) the method the
+    /// rule kind temporary-copy-without-asking calls in place of dialog.ShowDialog(owner):
+    ///   internal static DialogResult CitaviCrossover_TemporaryCopy(CommonDialog dialog, IWin32Window owner) {
+    ///       try {
+    ///           string root = Path.Combine(Path.GetTempPath(), "Citavi copies");
+    ///           string dir = Path.Combine(root, DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+    ///           if (!Directory.Exists(dir)) {                       // the first copy of a day:
+    ///               try { Directory.Delete(root, true); } catch (Exception) { }      // the copies of earlier days go
+    ///               Directory.CreateDirectory(dir);
+    ///           }
+    ///           FileDialog file = (FileDialog)dialog;
+    ///           file.FileName = Path.Combine(dir, Path.GetFileName(file.FileName));  // the name the program proposed
+    ///           return DialogResult.OK;
+    ///       } catch (Exception) { return dialog.ShowDialog(owner); }                  // then ask, as before
+    ///   }
+    /// </summary>
+    static MethodDefinition TemporaryCopyHelper(ModuleDefinition module, TypeDefinition type, MethodReference showDialog)
+    {
+        var existing = module.GetTypes().SelectMany(t => t.Methods).FirstOrDefault(m => m.Name == TemporaryCopyName);
+        if (existing != null) return existing;
+        var ts = module.TypeSystem;
+        TypeReference Core(string ns, string n, bool value = false) => new TypeReference(ns, n, module, ts.CoreLibrary, value);
+        MethodReference Method(TypeReference declaring, string n, TypeReference returns, bool instance, params TypeReference[] parameters)
+        {
+            var m = new MethodReference(n, returns, declaring) { HasThis = instance };
+            foreach (var t in parameters) m.Parameters.Add(new ParameterDefinition(t));
+            return module.ImportReference(m);
+        }
+        TypeReference commonDialog = showDialog.DeclaringType, owner = showDialog.Parameters[0].ParameterType, dialogResult = showDialog.ReturnType;
+        var fileDialog = new TypeReference("System.Windows.Forms", "FileDialog", module, commonDialog.Scope);
+        TypeReference path = Core("System.IO", "Path"), directory = Core("System.IO", "Directory"), directoryInfo = Core("System.IO", "DirectoryInfo"),
+            dateTime = Core("System", "DateTime", true), cultureInfo = Core("System.Globalization", "CultureInfo"),
+            formatProvider = Core("System", "IFormatProvider"), exception = Core("System", "Exception");
+        var getTempPath = Method(path, "GetTempPath", ts.String, false);
+        var combine = Method(path, "Combine", ts.String, false, ts.String, ts.String);
+        var getFileName = Method(path, "GetFileName", ts.String, false, ts.String);
+        var exists = Method(directory, "Exists", ts.Boolean, false, ts.String);
+        var delete = Method(directory, "Delete", ts.Void, false, ts.String, ts.Boolean);
+        var createDirectory = Method(directory, "CreateDirectory", directoryInfo, false, ts.String);
+        var now = Method(dateTime, "get_Now", dateTime, false);
+        var dateToString = Method(dateTime, "ToString", ts.String, true, ts.String, formatProvider);
+        var invariant = Method(cultureInfo, "get_InvariantCulture", cultureInfo, false);
+        var getName = Method(fileDialog, "get_FileName", ts.String, true);
+        var setName = Method(fileDialog, "set_FileName", ts.Void, true, ts.String);
+
+        var helper = new MethodDefinition(TemporaryCopyName, MethodAttributes.Assembly | MethodAttributes.Static | MethodAttributes.HideBySig, dialogResult);
+        helper.Parameters.Add(new ParameterDefinition("dialog", ParameterAttributes.None, commonDialog));
+        helper.Parameters.Add(new ParameterDefinition("owner", ParameterAttributes.None, owner));
+        helper.Body.InitLocals = true;
+        VariableDefinition Local(TypeReference t) { var v = new VariableDefinition(t); helper.Body.Variables.Add(v); return v; }
+        VariableDefinition root = Local(ts.String), dir = Local(ts.String), today = Local(dateTime), result = Local(dialogResult);
+        {
+            var il = helper.Body.GetILProcessor();
+            var begin = Instruction.Create(OpCodes.Call, getTempPath);
+            var deleteOld = Instruction.Create(OpCodes.Ldloc, root);
+            var deleteFailed = Instruction.Create(OpCodes.Pop);
+            var create = Instruction.Create(OpCodes.Ldloc, dir);
+            var haveDir = Instruction.Create(OpCodes.Ldarg_0);
+            var ask = Instruction.Create(OpCodes.Pop);
+            var done = Instruction.Create(OpCodes.Ldloc, result);
+            il.Append(begin); il.Emit(OpCodes.Ldstr, "Citavi copies"); il.Emit(OpCodes.Call, combine); il.Emit(OpCodes.Stloc, root);
+            il.Emit(OpCodes.Ldloc, root);
+            il.Emit(OpCodes.Call, now); il.Emit(OpCodes.Stloc, today);
+            il.Emit(OpCodes.Ldloca, today); il.Emit(OpCodes.Ldstr, "yyyy-MM-dd"); il.Emit(OpCodes.Call, invariant); il.Emit(OpCodes.Call, dateToString);
+            il.Emit(OpCodes.Call, combine); il.Emit(OpCodes.Stloc, dir);
+            il.Emit(OpCodes.Ldloc, dir); il.Emit(OpCodes.Call, exists); il.Emit(OpCodes.Brtrue, haveDir);
+            // try { Directory.Delete(root, true); } catch (Exception) { }
+            il.Append(deleteOld); il.Emit(OpCodes.Ldc_I4_1); il.Emit(OpCodes.Call, delete); il.Emit(OpCodes.Leave, create);
+            il.Append(deleteFailed); il.Emit(OpCodes.Leave, create);
+            il.Append(create); il.Emit(OpCodes.Call, createDirectory); il.Emit(OpCodes.Pop);
+            // ((FileDialog)dialog).FileName = Path.Combine(dir, Path.GetFileName(((FileDialog)dialog).FileName));
+            il.Append(haveDir); il.Emit(OpCodes.Castclass, fileDialog);
+            il.Emit(OpCodes.Ldloc, dir);
+            il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Castclass, fileDialog); il.Emit(OpCodes.Callvirt, getName);
+            il.Emit(OpCodes.Call, getFileName); il.Emit(OpCodes.Call, combine);
+            il.Emit(OpCodes.Callvirt, setName);
+            il.Emit(OpCodes.Ldc_I4_1); il.Emit(OpCodes.Stloc, result);   // DialogResult.OK
+            il.Emit(OpCodes.Leave, done);
+            // catch (Exception) { result = dialog.ShowDialog(owner); }
+            il.Append(ask); il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldarg_1); il.Emit(OpCodes.Callvirt, module.ImportReference(showDialog));
+            il.Emit(OpCodes.Stloc, result); il.Emit(OpCodes.Leave, done);
+            il.Append(done); il.Emit(OpCodes.Ret);
+            var anything = module.ImportReference(exception);
+            helper.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)   // the inner one first
+            { TryStart = deleteOld, TryEnd = deleteFailed, HandlerStart = deleteFailed, HandlerEnd = create, CatchType = anything });
+            helper.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+            { TryStart = begin, TryEnd = ask, HandlerStart = ask, HandlerEnd = done, CatchType = anything });
+            helper.Body.OptimizeMacros();
+        }
+        type.Methods.Add(helper);
+        return helper;
     }
 
     /// <summary>
