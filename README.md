@@ -303,19 +303,29 @@ can be installed without clicking.
 
 ### When this tool has a new version
 
-Get the new files over the old ones, then run setup again. Setup skips what is already done and
-applies what is new.
+Quit Citavi, get the new files over the old ones, then run setup again. Setup skips what is
+already done and applies what is new. It stops at the patches if Citavi is still open.
+
+If you downloaded the folder:
 
 ```bash
 cd ~ && curl -L https://github.com/AthanasiusOfAlex/citavi-crossover/archive/refs/heads/main.tar.gz | tar xz --strip-components 1 -C citavi-crossover
 ```
 
+This line replaces `config.sh` too. If you changed settings there, change them again afterwards.
+The downloaded installers in `resources/` stay.
+
+If you got the folder with `git clone`:
+
+```bash
+cd ~/citavi-crossover && git pull
+```
+
+Then, either way:
+
 ```bash
 cd ~/citavi-crossover && ./citavi-crossover setup
 ```
-
-The first line replaces `config.sh` too. If you changed settings there, change them again
-afterwards. The downloaded installers in `resources/` stay.
 
 ## Removing it
 
